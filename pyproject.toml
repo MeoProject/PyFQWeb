@@ -1,0 +1,24 @@
+[tool.poetry]
+name = "pyfqweb"
+version = "0.1.12"
+description = "FQWeb xposed server styled backend FanQieNovel API"
+authors = ["helloplhm-qwq"]
+license = "MIT"
+readme = "README.md"
+package-mode = false
+
+[tool.poetry.dependencies]
+python = "^3.8"
+aiohttp = "^3.9.3"
+pycryptodome = "^3.20.0"
+ujson = "^5.9.0"
+requests = "^2.31.0"
+colorlog = "^6.8.2"
+Pygments = "^2.17.2"
+xmltodict = "^0.13.0"
+colorama = "^0.4.6"
+aiofiles = "^23.2.1"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
