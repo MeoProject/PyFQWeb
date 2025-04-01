@@ -1,9 +1,9 @@
 [tool.poetry]
 name = "pyfqweb"
 version = "0.1.12"
-description = "FQWeb xposed server styled backend FanQieNovel API"
+description = "An Xposed module(FQWeb) styled fanqienovel api, written in Python"
 authors = ["helloplhm-qwq"]
-license = "MIT"
+license = "GPLv3"
 readme = "README.md"
 package-mode = false
 
