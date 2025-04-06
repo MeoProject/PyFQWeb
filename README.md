@@ -42,6 +42,7 @@ pm2 start npm --name "pyfqweb" -- start
 | 正文预览 | `/item-summary`                         | GET       | `book_id`: 书籍ID<br>`item_ids`: 逗号分隔的章节ID列表                   |
 | 听书服务 | `/audio`                                | GET       | `item_ids`: 音频ID列表                                                   |
 | 短剧服务 | `/video`                                | GET       | `item_ids`: 视频ID列表                                                   |
+| 接口信息 | `/self-info`                            | GET       | 无                                       |
 
 ### 扩展接口
 ```markdown
