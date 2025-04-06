@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "pyfqweb"
-version = "0.1.12"
+version = "0.1.13"
 description = "An Xposed module(FQWeb) styled fanqienovel api, written in Python"
 authors = ["helloplhm-qwq"]
 license = "GPLv3"
