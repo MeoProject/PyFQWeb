@@ -1,0 +1,1857 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>小说搜索与下载</title>
+    <script id="FileSaver.js" src="https://s4.zstatic.net/ajax/libs/FileSaver.js/2.0.5/FileSaver.min.js"></script>
+    <!-- 自己把下面两行取消注释启用移动端开发者工具 -->
+    <!-- <script id="eruda.js" src="https://s4.zstatic.net/ajax/libs/eruda/3.4.1/eruda.min.js" integrity="sha512-3RVqOZtMevFOLeXCp0/Wl7np/l3J3MMysaFDUhNh+hdKx+Wb0lMXuHwA6CZ/+4DfYZM01Om1as8g+mnTaQH9vA==" crossorigin="anonymous" referrerpolicy="no-referrer"></script> -->
+    <!-- <script> eruda.init() </script> -->
+    <script id="moment.js" src="https://s4.zstatic.net/ajax/libs/moment.js/2.30.1/moment.min.js"></script>
+    <script id="lodash.js" src="https://s4.zstatic.net/ajax/libs/lodash.js/4.17.21/lodash.min.js"></script>
+    <script
+      id="jszip"
+      src="https://s4.zstatic.net/ajax/libs/jszip/3.10.1/jszip.min.js"
+      integrity="sha512-XMVd28F1oH/O71fzwBnV7HucLxVwtxf26XV8P4wPk26EDxuGZ91N8bsOttmnomcCD3CS5ZMRL50H0GgOHvegtg=="
+      crossorigin="anonymous"
+      referrerpolicy="no-referrer"
+    ></script>
+    <script id="gbk.js">
+      // 本来是压缩过的，结果格式化工具又给我格式化了，干脆不管了
+      'use strict'
+      let table
+      function initGbkTable() {
+        var r,
+          t,
+          e,
+          o,
+          n = new Uint16Array(23940)
+        let f = 0
+        for ([r, t, e, o] of [
+          [161, 169, 161, 254],
+          [176, 247, 161, 254],
+          [129, 160, 64, 254],
+          [170, 254, 64, 160],
+          [168, 169, 64, 160],
+          [170, 175, 161, 254],
+          [248, 254, 161, 254],
+          [161, 167, 64, 160],
+        ])
+          for (let l = e; l <= o; l++) if (127 !== l) for (let e = r; e <= t; e++) n[f++] = (l << 8) | e
+        ;(table = new Uint16Array(65536)).fill(65535)
+        var l = new TextDecoder('gbk').decode(n)
+        for (let e = 0; e < l.length; e++) table[l.charCodeAt(e)] = n[e]
+      }
+      const NodeJsBufAlloc = 'function' == typeof globalThis.Buffer && Buffer.allocUnsafe,
+        defaultOnAlloc = NodeJsBufAlloc ? e => NodeJsBufAlloc(e) : e => new Uint8Array(e),
+        defaultOnError = () => 63
+      window.encodeGBK = function (l, e = {}) {
+        table || initGbkTable()
+        var r = e.onAlloc || defaultOnAlloc,
+          t = e.onError || defaultOnError,
+          o = r(2 * l.length)
+        let n = 0
+        for (let e = 0; e < l.length; e++) {
+          var f = l.charCodeAt(e)
+          if (f < 128) o[n++] = f
+          else {
+            var a = table[f]
+            if (65535 !== a) (o[n++] = a), (o[n++] = a >> 8)
+            else if (8364 === f) o[n++] = 128
+            else {
+              a = t(e, l)
+              if (-1 === a) break
+              255 < a ? ((o[n++] = a), (o[n++] = a >> 8)) : (o[n++] = a)
+            }
+          }
+        }
+        return o.subarray(0, n)
+      }
+    </script>
+    <script id="epub-saver.js">
+      'use strict'
+      class EpubSaver {
+        constructor() {
+          this.resources = new Map()
+          this.resourceUrls = new Map()
+          this.volumes = []
+          this.cssList = []
+          this.cssMap = new Map()
+          this.info = {}
+          this.uuid = this.generateUUID()
+          this.resourceCounters = { image: 0, css: 0, other: 0 }
+        }
+
+        generateUUID() {
+          return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+            const r = (Math.random() * 16) | 0,
+              v = c === 'x' ? r : (r & 0x3) | 0x8
+            return v.toString(16)
+          })
+        }
+
+        async setInfo(tag, value) {
+          if (tag === 'cover') {
+            if (typeof value === 'string') {
+              const response = await fetch(value)
+              const blob = await response.blob()
+              const arrayBuffer = await blob.arrayBuffer()
+              value = new Uint8Array(arrayBuffer)
+            }
+            this.info.cover = value
+          } else {
+            this.info[tag] = value
+          }
+        }
+
+        addVolume(title, idx) {
+          const volume = new Volume(this, title, idx)
+          this.volumes.push(volume)
+          return volume
+        }
+
+        async addCSS(idx, content, filename, mapname) {
+          let cssContent = content
+
+          if (typeof content === 'string' && /^https?:\/\//.test(content)) {
+            const response = await fetch(content)
+            cssContent = await response.text()
+          }
+
+          cssContent = await this.processCSSUrls(cssContent)
+
+          if (!filename) {
+            filename = `Styles/style${this.resourceCounters.css++}.css`
+          }
+
+          this._addResource(filename, new TextEncoder().encode(cssContent))
+          this.cssList.push({ idx, filename, mapname })
+
+          if (mapname) {
+            this.cssMap.set(mapname, idx)
+          }
+
+          return idx
+        }
+
+        async processCSSUrls(css) {
+          const urlRegex = /url\(\s*['"]?(.*?)['"]?\s*\)/g
+          const replacements = []
+
+          let match
+          while ((match = urlRegex.exec(css)) !== null) {
+            const url = match[1]
+            if (!this.resourceUrls.has(url)) {
+              try {
+                const response = await fetch(url)
+                const blob = await response.blob()
+                const arrayBuffer = await blob.arrayBuffer()
+                const ext = url.split('.').pop().split(/[#?]/)[0] || 'bin'
+                const filename = `resources/res${this.resourceCounters.other++}.${ext}`
+                this._addResource(filename, new Uint8Array(arrayBuffer))
+                this.resourceUrls.set(url, filename)
+              } catch (e) {
+                console.warn('Failed to fetch CSS resource:', url)
+              }
+            }
+            replacements.push([url, this.resourceUrls.get(url) || url])
+          }
+
+          return replacements.reduce(
+            (acc, [url, path]) => acc.replace(new RegExp(url.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), path),
+            css
+          )
+        }
+
+        async createCSSMap(map) {
+          const results = {}
+          let maxIdx = Math.max(...this.cssList.map(c => c.idx), 0)
+
+          for (const [mapname, content] of Object.entries(map)) {
+            const idx = ++maxIdx
+            await this.addCSS(idx, content, mapname, mapname)
+            results[mapname] = idx
+          }
+
+          return results
+        }
+
+        _addResource(path, content) {
+          if (!this.resources.has(path)) {
+            this.resources.set(path, content)
+          }
+        }
+
+        async save() {
+          const zip = new JSZip()
+
+          // Add mimetype
+          zip.file('mimetype', 'application/epub+zip', { compression: 'STORE' })
+
+          // Create container
+          const container = `<?xml version="1.0"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles>
+    <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
+  </rootfiles>
+</container>`
+          zip.folder('META-INF').file('container.xml', container)
+
+          // Generate OPF
+          const opf = this.generateOPF()
+          zip.folder('OEBPS').file('content.opf', opf)
+          const ncxContent = this.generateNCX()
+          zip.folder('OEBPS').file('toc.ncx', ncxContent)
+
+          // Add all resources
+          this.resources.forEach((content, path) => {
+            zip.folder('OEBPS').file(path, content)
+          })
+
+          // Generate nav
+          const nav = this.generateNav()
+          zip.folder('OEBPS').file('nav.xhtml', nav)
+
+          return zip.generateAsync({ type: 'uint8array', compression: 'DEFLATE' })
+        }
+
+        generateNCX() {
+          let playOrder = 1
+          const navPoints = []
+
+          this.volumes
+            .sort((a, b) => a.idx - b.idx)
+            .forEach(vol => {
+              // 为每个卷创建容器navPoint（不设置具体内容）
+              const volumePoint = `
+      <navPoint id="navpoint-${playOrder}" playOrder="${playOrder++}">
+        <navLabel><text>${vol.title}</text></navLabel>
+        <content src="${vol.containerFile || vol.chapters[0]?.filename}"/>`
+
+              // 创建章节navPoint
+              const chapterPoints = vol.chapters
+                .sort((a, b) => a.idx - b.idx)
+                .map(
+                  chap => `
+          <navPoint id="navpoint-${playOrder}" playOrder="${playOrder++}">
+            <navLabel><text>${chap.title}</text></navLabel>
+            <content src="${chap.filename}"/>
+          </navPoint>`
+                )
+                .join('')
+
+              navPoints.push(`${volumePoint}${chapterPoints}</navPoint>`)
+            })
+
+          return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE ncx PUBLIC "-//NISO//DTD ncx 2005-1//EN" "http://www.daisy.org/z3986/2005/ncx-2005-1.dtd">
+<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">
+  <head>
+    <meta name="dtb:uid" content="urn:uuid:${this.uuid}"/>
+    <meta name="dtb:depth" content="2"/>
+    <meta name="dtb:totalPageCount" content="0"/>
+    <meta name="dtb:maxPageNumber" content="0"/>
+  </head>
+  <docTitle>
+    <text>${this.info.bookname || 'Untitled'}</text>
+  </docTitle>
+  <navMap>
+    ${navPoints.join('')}
+  </navMap>
+</ncx>`
+        }
+
+        generateOPF() {
+          const metadata = [
+            `<dc:identifier id="BookId">urn:uuid:${this.uuid}</dc:identifier>`,
+            `<dc:title>${this.info.bookname || 'Untitled'}</dc:title>`,
+            `<dc:creator>${this.info.author || 'Unknown'}</dc:creator>`,
+            `<dc:description>${this.info.introduction || ''}</dc:description>`,
+            `<dc:language>zh-CN</dc:language>`,
+            `<meta property="dcterms:modified">${moment(Date.now()).utc().format('YYYY-MM-DDTHH:mm:ss')}Z</meta>`,
+          ]
+
+          // 增强封面处理
+          if (this.info.cover) {
+            metadata.push(`<meta name="cover" content="cover-image"/>`, `<meta property="rendition:layout">pre-paginated</meta>`)
+            this._addResource('images/cover.jpg', this.info.cover)
+
+            // 添加封面XHTML页面
+            const coverHtml = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head>
+  <meta name="viewport" content="width=device-width, height=device-height, initial-scale=1.0, minimum-scale=1.0"/>
+  <title>Cover</title>
+</head>
+<body>
+  <div style="text-align: center; padding: 0pt; margin: 0pt;">
+    <img src="images/cover.jpg" alt="Cover Image" style="height: 100%; max-width: 100%;"/>
+  </div>
+</body>
+</html>`
+            this._addResource('cover.xhtml', new TextEncoder().encode(coverHtml))
+          }
+
+          const manifest = [
+            '<item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>',
+            '<item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>',
+          ]
+
+          if (this.info.cover) {
+            manifest.push(
+              '<item id="cover-image" href="images/cover.jpg" media-type="image/jpeg" properties="cover-image"/>',
+              '<item id="cover" href="cover.xhtml" media-type="application/xhtml+xml"/>'
+            )
+          }
+
+          this.resources.forEach((_, path) => {
+            const id = path.replace(/[^a-z0-9]/gi, '-')
+            let type = 'application/octet-stream'
+            if (path.endsWith('.xhtml')) type = 'application/xhtml+xml'
+            else if (path.endsWith('.css')) type = 'text/css'
+            else if (path.match(/\.jpe?g$/)) type = 'image/jpeg'
+            else if (path.endsWith('.png')) type = 'image/png'
+            manifest.push(`<item id="${id}" href="${path}" media-type="${type}"/>`)
+          })
+
+          const spine = []
+          if (this.info.cover) {
+            spine.push('<itemref idref="cover"/>')
+          }
+          this.volumes
+            .sort((a, b) => a.idx - b.idx)
+            .forEach(v => {
+              v.chapters
+                .sort((a, b) => a.idx - b.idx)
+                .forEach(c => {
+                  spine.push(`<itemref idref="${c.filename.replace(/[^a-z0-9]/gi, '-')}"/>`)
+                })
+            })
+
+          const guide = this.info.cover ? `<reference href="cover.xhtml" type="cover" title="Cover"/>` : ''
+
+          return `<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" unique-identifier="BookId" version="3.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    ${metadata.join('\n    ')}
+  </metadata>
+  <manifest>
+    ${manifest.join('\n    ')}
+  </manifest>
+  <spine toc="ncx">
+    ${spine.join('\n    ')}
+  </spine>
+  <guide>
+    ${guide}
+  </guide>
+</package>`
+        }
+
+        generateNav() {
+          const items = this.volumes
+            .sort((a, b) => a.idx - b.idx)
+            .map(
+              v => `
+      <li>
+        <a href="${v.chapters[0]?.filename || ''}">${v.title}</a>
+        <ol>
+          ${v.chapters
+            .sort((a, b) => a.idx - b.idx)
+            .map(
+              c => `
+            <li><a href="${c.filename}">${c.title}</a></li>
+          `
+            )
+            .join('')}
+        </ol>
+      </li>
+    `
+            )
+            .join('')
+
+          return `<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
+<head>
+  <title>Table of Contents</title>
+</head>
+<body>
+  <nav epub:type="toc">
+    <h1>Table of Contents</h1>
+    <ol>
+      ${items}
+    </ol>
+  </nav>
+</body>
+</html>`
+        }
+      }
+
+      class Volume {
+        constructor(epub, title, idx) {
+          this.epub = epub
+          this.title = title
+          this.idx = idx
+          this.chapters = []
+          this.containerFile = `volume_${idx}.xhtml`
+          const content = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml">
+  <head>
+    <title>${title}</title>
+  </head>
+  <body>
+    <h1>${title}</h1>
+  </body>
+</html>`
+          this.epub._addResource(this.containerFile, new TextEncoder().encode(content))
+          // MIME 类型到扩展名映射
+          this.mimeMap = new Map([
+            ['image/jpeg', 'jpg'],
+            ['image/png', 'png'],
+            ['image/gif', 'gif'],
+            ['image/webp', 'webp'],
+            ['image/svg+xml', 'svg'],
+            ['image/avif', 'avif'],
+            ['application/octet-stream', 'bin'],
+          ])
+        }
+
+        async addChapter(idx, content, title, contentType, insertTitle = true, useGlobalCSS = true, cssList = []) {
+          let chapD = this._extractContent(content)
+          // console.log('nohtmlTag', chapD)
+          // 内容预处理
+          let processed = this._wrapContent(chapD, title, contentType, insertTitle)
+          // console.log(processed)
+
+          // 图片处理
+          const { content: finalContent, resources } = await this.processImages(processed)
+
+          // 资源注册
+          this._registerResources(resources)
+
+          // 构建 XHTML
+          // console.log(this._extractContent(finalContent));
+          const xhtml = this._buildXHTML(this._wrapContent(finalContent), title, useGlobalCSS, cssList)
+          const filename = `chapter_${this.idx}_${idx}.xhtml`
+
+          this.epub._addResource(filename, new TextEncoder().encode(xhtml))
+          this.chapters.push({ idx, title, filename })
+
+          return idx
+        }
+
+        async processImages(content) {
+          const parser = new DOMParser()
+          const doc = parser.parseFromString(content, 'text/html')
+          const images = doc.querySelectorAll('img')
+          const resources = []
+
+          await Promise.all(
+            Array.from(images).map(async img => {
+              let url = img.getAttribute('src')
+              if (!url || this.epub.resourceUrls.has(url)) return
+
+              try {
+                if (!url.startsWith('http')) {
+                  throw new Error('img src is not an url')
+                }
+                console.log('fetch chapter.image', url)
+                if (url.startsWith('http://') && window.location.href.startsWith('https://')) {
+                  console.warn(
+                    'DeprecationWarning:',
+                    'Mixed content warning: image is transported by unsafe protocol "http"',
+                    'try upgrade to https'
+                  )
+                  url = url.replace('http://', 'https://')
+                }
+                const response = await fetch(url)
+
+                if (!response.ok) throw new Error(`HTTP ${response.status}`)
+
+                // 类型识别
+                const contentType = response.headers.get('Content-Type') || 'application/octet-stream'
+                const [mimeType] = contentType.split(';')
+                const ext = this._getExtension(mimeType, url)
+
+                // 二进制处理
+                const arrayBuffer = await response.arrayBuffer()
+                const filename = `images/img${this.epub.resourceCounters.image++}.${ext}`
+
+                img.setAttribute('src', filename)
+                resources.push([url, filename, new Uint8Array(arrayBuffer)])
+              } catch (e) {
+                console.warn(`Image processing failed: ${url}`, e)
+                img.remove() // 自动移除无效图片
+              }
+            })
+          )
+
+          // 序列化处理
+          const serializer = new XMLSerializer()
+          let processed = serializer.serializeToString(doc.documentElement).replace(/^<div>|<\/div>$/g, '') // 移除包装 div
+
+          return { content: processed, resources }
+        }
+
+        // 私有辅助方法
+        _wrapContent(content, title, contentType, insertTitle) {
+          if (contentType === 'text') {
+            return `<pre>${insertTitle ? `<h1>${title}</h1>` : ''}${content}</pre>`
+          }
+          if (contentType === 'html' && insertTitle) {
+            return `<h1>${title}</h1>${content}`
+          }
+          return content
+        }
+
+        _registerResources(resources) {
+          resources.forEach(([url, path, data]) => {
+            this.epub.resourceUrls.set(url, path)
+            this.epub._addResource(path, data)
+          })
+        }
+
+        _buildXHTML(content1, title, useGlobalCSS, cssList) {
+          const cssLinks = []
+
+          if (useGlobalCSS) {
+            const globalCSS = this.epub.cssList.find(c => c.idx === 0)
+            if (globalCSS) cssLinks.push(globalCSS)
+          }
+
+          cssList.forEach(idx => {
+            console.log('find css idx', idx)
+            const css = this.epub.cssList.find(c => c.idx === idx)
+            if (css) cssLinks.push(css)
+          })
+          // console.log(content1)
+          return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head>
+  <meta name="viewport" content="width=device-width, height=device-height, initial-scale=1.0"/>
+  <title>${this._escapeXML(title)}</title>
+  ${cssLinks.map(c => `<link href="${c.filename}" rel="stylesheet"/>`).join('\n  ')}
+</head>
+<body>
+  ${this._extractContent(content1)}
+</body>
+</html>`
+        }
+
+        _getExtension(mimeType, url) {
+          // 优先使用 MIME 类型
+          const fromMime = this.mimeMap.get(mimeType) || mimeType.split('/').pop()
+
+          // 后备使用 URL 后缀
+          const fromUrl = url.split(/[#?]/)[0].split('.').pop()
+
+          return (fromMime || fromUrl || 'bin').toLowerCase()
+        }
+
+        _escapeXML(str) {
+          return str.replace(
+            /[<>&'"]/g,
+            c =>
+              ({
+                '<': '&lt;',
+                '>': '&gt;',
+                '&': '&amp;',
+                "'": '&apos;',
+                '"': '&quot;',
+              }[c])
+          )
+        }
+
+        _extractContent(html) {
+          try {
+            const articleMatch = html.match(/<article>([\s\S]*?)<\/article>/i)
+            if (articleMatch) return articleMatch[1]
+
+            const bodyMatch = html.match(/<body>([\s\S]*?)<\/body>/i)
+            if (bodyMatch) return bodyMatch[1]
+
+            return html
+          } catch (e) {
+            console.warn('内容解析失败，使用原始内容', e)
+            return html
+          }
+        }
+      }
+
+      if (globalThis.window == globalThis) {
+        window.EpubSaver = EpubSaver
+      }
+    </script>
+  </head>
+  <body>
+    <button class="toggle-theme" onclick="toggleTheme()">
+      <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" id="light">
+        <circle cx="12" cy="12" r="10" fill="currentColor" />
+      </svg>
+      <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" id="dark">
+        <path
+          fill="currentColor"
+          d="M10 2c-1.82 0-3.53.5-5 1.35C7.99 5.08 10 8.3 10 12s-2.01 6.92-5 8.65C6.47 21.5 8.18 22 10 22c5.52 0 10-4.48 10-10S15.52 2 10 2"
+        />
+      </svg>
+    </button>
+    <h1 id="title">小说搜索与下载</h1>
+    <div id="container" class="container">
+      <form class="search-form" id="search-form">
+        <input type="text" id="book-search" placeholder="请输入小说名称" />
+        <button type="button" onclick="searchBooks()">
+          <svg xmlns="http://www.w3.org/2000/svg" fill="currentColor" width="24" height="24" viewBox="0 0 24 24" display="inherit">
+            <path d="M16.296 16.996a8 8 0 11.707-.708l3.909 3.91-.707.707-3.909-3.909zM18 11a7 7 0 00-14 0 7 7 0 1014 0z" />
+          </svg>
+        </button>
+      </form>
+      <div id="book-list" class="book-list"></div>
+      <div id="book-info" class="book-info">
+        <img src="" alt="封面" id="book-cover" />
+        <div class="book-info-container">
+          <p id="book_id" style="display: none"></p>
+          <p id="book_info" style="display: none"></p>
+          <p id="download_lock" style="display: none"></p>
+          <h2 id="book-title"></h2>
+          <p><strong>作者：</strong><span id="book-author"></span></p>
+          <p><strong>分类：</strong><span id="book-category"></span></p>
+          <p><strong>状态：</strong><span id="creation-status"></span></p>
+          <p><strong>最新章节：</strong><span id="latest-chapter"></span> <span id="latest-chapter-passtime"></span></p>
+          <p id="book-description"></p>
+          <button class="download-btn" onclick="downloadBook()">下载</button>
+          <select id="charset-selector" class="charset-selector">
+            <option value="utf-8">UTF-8</option>
+            <option value="gbk">GBK</option>
+          </select>
+          <select id="format-selector" class="charset-selector">
+            <option value="txt">TXT</option>
+            <option value="epub">EPUB</option>
+          </select>
+        </div>
+      </div>
+    </div>
+    <!-- 进度条弹窗 -->
+    <div id="progress-modal" class="progress-modal" style="display: none">
+      <div class="progress-box">
+        <h3 id="progress-title" class="progress-title">下载进度</h3>
+        <div class="progress-bar">
+          <div id="progress-bar-fill" class="progress-bar-fill"></div>
+        </div>
+        <div class="progress-text">
+          <p id="progress-percentage">0%</p>
+          <p id="progress-count">0/0</p>
+        </div>
+        <button id="progress-cancel" class="progress-cancel">取消</button>
+        <button id="progress-submit" class="progress-submit" style="display: none">确定</button>
+        <button id="button-resave" class="button-resave" style="display: none" onclick="reSave()">手动保存</button>
+        <button id="button-redownload" class="button-redownload" style="display: none" onclick="reDownload()">重新下载</button>
+      </div>
+    </div>
+    <!-- 点击书名后的弹窗 -->
+    <dialog id="internal-alert" class="internal-alert">
+      <div id="internal-alert-container" class="internal-alert-container">
+        <span>内容</span>
+      </div>
+    </dialog>
+    <hr>
+    <div class="footer">
+      <div class="about-container">
+        <p class="about-text">本网页为 <a href="https://github.com/MeoProject/PyFQWeb">PyFQWeb</a> 项目的一部分，请遵守开源协议使用</p>
+      </div>
+    </div>
+    <script>
+      const apiNode = ''
+      if (!apiNode) alert('请配置apiNode后再使用网页（需要支持跨域）')
+
+      // 设置页面主题
+      function setTheme(theme) {
+        document.body.dataset.theme = theme
+        document.getElementById(theme).setAttribute('display', 'block')
+        document.getElementById(theme === 'dark' ? 'light' : 'dark').setAttribute('display', 'none')
+      }
+
+      // 自动检测浏览器主题并设置页面主题
+      function setThemeBasedOnPreference() {
+        const savedTheme = localStorage.getItem('theme')
+        if (savedTheme) {
+          setTheme(savedTheme)
+        } else {
+          const systemTheme = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
+          setTheme(systemTheme)
+        }
+      }
+
+      // 切换主题并保存到localStorage
+      function toggleTheme() {
+        const currentTheme = document.body.dataset.theme || 'light'
+        const newTheme = currentTheme === 'dark' ? 'light' : 'dark'
+        setTheme(newTheme)
+        localStorage.setItem('theme', newTheme)
+      }
+
+      // 初始化主题
+      setThemeBasedOnPreference()
+      // 初始化form提交事件
+      document.getElementById('search-form').addEventListener('submit', function (event) {
+        event.preventDefault()
+        searchBooks()
+      })
+
+      function formatCount(num, lang) {
+        const units = {
+          'zh': [{d: 1e8, s: '亿'}, {d: 1e4, s: '万'}],
+          'en': [{d: 1e9, s: 'billion'}, {d: 1e6, s: 'million'}, {d: 1e3, s: 'thousand'}],
+          'ja': [{d: 1e8, s: '億'}, {d: 1e4, s: '万'}],
+          'ko': [{d: 1e8, s: '억'}, {d: 1e4, s: '만'}],
+          'de': [{d: 1e9, s: 'Milliarde'}, {d: 1e6, s: 'Million'}, {d: 1e3, s: 'Tausend'}],
+          'es': [{d: 1e9, s: 'mil millones'}, {d: 1e6, s: 'millón'}, {d: 1e3, s: 'mil'}],
+          'ru': [{d: 1e9, s: 'миллиард'}, {d: 1e6, s: 'миллион'}, {d: 1e3, s: 'тысяча'}],
+          'ar': [{d: 1e9, s: 'مليار'}, {d: 1e6, s: 'مليون'}, {d: 1e3, s: 'ألف'}]
+        };
+
+        const browserLang = (navigator.language || 'en').substring(0,2);
+        const targetLang = units[lang] ? lang : units[browserLang] ? browserLang : 'en';
+
+        const unit = units[targetLang].find(u => num >= u.d) || {d:1, s:''};
+        const value = num / unit.d;
+
+        const formatted = value.toLocaleString(targetLang, {
+          maximumFractionDigits: 3,
+          minimumFractionDigits: 0
+        }).replace(/\.0+$/, '');
+
+        return targetLang === 'ar' 
+          ? `${formatted}\u202C${unit.s}\u202C` 
+          : `${formatted}${unit.s}`;
+      }
+      
+      function formatDuration(seconds) {
+        // 处理负数边界情况
+        const totalSeconds = Math.max(0, Math.round(seconds));
+    
+        // 时间单位分解
+        const hours = Math.floor(totalSeconds / 3600);
+        const remaining = totalSeconds % 3600;
+        const minutes = Math.floor(remaining / 60);
+        const secs = remaining % 60;
+
+        // 构建时间片段
+        const timeFragments = [];
+        if (hours > 0) {
+          timeFragments.push(
+            hours.toString().padStart(2, '0'),
+            minutes.toString().padStart(2, '0')
+          );
+        } else {
+          timeFragments.push(minutes.toString().padStart(2, '0'));
+        }
+        timeFragments.push(secs.toString().padStart(2, '0'));
+
+        return timeFragments.join(':');
+      }
+
+      function isShitBrowser() {
+        const userAgent = navigator.userAgent.toLowerCase()
+        return /qua|qqbrowser|micromessenger|quark|baidu|uc|mbrowser/i.test(userAgent)
+      }
+
+      function timeStampFormat(ts) {
+        return moment(parseInt(ts) * 1000).format('YYYY-MM-DD HH:mm:ss')
+      }
+
+      if (isShitBrowser()) {
+        let now = Date.now()
+        while (Date.now() - now < 30000) {
+          alert(
+            '本站使用JS原生下载API\n请不要使用 夸克 QQ浏览器 百度 等国产魔改浏览器，否则你将无法正常保存书籍\n建议右转下载Via使用，谢谢\n本通知持续30秒，如果您执意要使用类似浏览器，请等30秒'
+          )
+        }
+      }
+
+      function matchId(url) {
+        const regex = /(?:\/page\/(\d{19})|[\?&]book_id=(\d{19}))/
+        const match = url.match(regex)
+
+        if (match || (url.length === 19 && !Number.isNaN(parseInt(url)))) {
+          return match ? match[1] || match[2] : url
+        } else {
+          return null
+        }
+      }
+
+      // 搜索书籍
+      async function searchBooks(k) {
+        const query = k || document.getElementById('book-search').value.trim()
+        if (!query) {
+          return
+        }
+        let _book_id = matchId(query)
+        if (_book_id) {
+          return await showBookInfo(_book_id)
+        }
+        const offset = 0 // 默认偏移量
+        const tabType = 3 // 默认搜索类型为书籍
+        const url = `${apiNode}/search?query=${query}&offset=${offset}&tab_type=${tabType}`
+
+        try {
+          const response = await fetch(url)
+          const data = await response.json()
+          // console.log(data)
+          const resp = data.search_tabs.find(tab => tab.tab_type === 3)?.data || []
+          let searchResults = []
+          for (let i of resp) {
+            let obj = (i.book_data || [])[0]
+            if (obj) searchResults.push(obj)
+          }
+          displaySearchResults(searchResults)
+        } catch (error) {
+          console.error('搜索失败:', error)
+        }
+      }
+
+      // 显示搜索结果
+      function displaySearchResults(results) {
+        const bookList = document.getElementById('book-list')
+        bookList.innerHTML = '' // 清空列表
+        results.forEach(result => {
+          const bookItem = document.createElement('div')
+          bookItem.classList.add('book-item')
+          bookItem.dataset.bookId = result.book_id
+          bookItem.innerHTML = `
+            <div>${result.book_name}</div>
+            <div>${result.author}</div>
+          `
+          bookItem.addEventListener('click', () => showBookInfo(result.book_id))
+          bookList.appendChild(bookItem)
+        })
+        const bookInfo = document.getElementById('book-info')
+        bookInfo.style.display = 'none' // 隐藏书籍详情区域
+      }
+
+      // 显示书籍详细信息
+      async function showBookInfo(bookId) {
+        const platformMap = {
+          '1967': '番茄APP',
+          '1128': '抖音',
+          '13': '今日头条'
+        }
+        // console.log('saveAs', saveAs)
+        const bookList = document.getElementById('book-list')
+        bookList.innerHTML = '' // 清空搜索列表
+        const url = `${apiNode}/info?book_id=${bookId}`
+        try {
+          const response = await fetch(url)
+          const data = await response.json()
+          const bookData = data.data || {} // 返回的数据在`data`字段中
+
+          // 填充书籍信息到页面
+          const bookInfo = document.getElementById('book-info')
+          bookInfo.style.display = 'flex' // 显示书籍详情区域
+
+          document.getElementById('book_id').innerHTML = bookId
+          document.getElementById('book_info').innerHTML = JSON.stringify(bookData)
+          document.getElementById('book-title').textContent = bookData.book_name || '未知标题'
+          document.getElementById('book-author').textContent = bookData.author || '未知作者'
+          document.getElementById('book-category').textContent = bookData.category || '未知分类'
+          document.getElementById('book-description').textContent = bookData.abstract || '暂无简介'
+          document.getElementById('book-cover').src = bookData.thumb_url || 'default_cover.jpg' // 默认封面
+          document.getElementById('creation-status').textContent = ['未知', '完结', '连载', null, null, null, '断更'][
+            (bookData.creation_status << 0) + 1
+          ]
+          document.getElementById('latest-chapter').textContent = bookData.last_chapter_title || '未知'
+          document.getElementById('latest-chapter-passtime').textContent = timeStampFormat(bookData.last_chapter_first_pass_time)
+          document.getElementById('internal-alert-container').innerHTML = `
+<h3 align="center">基础信息</h3>
+<p>书籍ID: ${bookData.book_id}  <a href="https://fanqienovel.com/page/${bookData.book_id}" target="_blank">去官方</a> <a href="legado://import/addToBookshelf?src=https%3A%2F%2Ffanqienovel.com%2F${bookData.book_id}">在开源阅读查看</a> <a href="dragon1967://reading?bookId=${bookData.book_id}">在番茄小说查看</a></p>
+<p>当前报告返回书名: ${bookData.book_name}</p>
+<p>书籍源名（作者开书使用的名字）: ${bookData.original_book_name} <a href="https://p6-novel.byteimg.com/origin/${bookData.thumb_uri}" target="_blank">查看封面</a></p>
+<p>书籍别名（书籍宣发使用的名字）: ${bookData.book_flight_alias_name || '无'} ${bookData.book_flight_alias_name ? '<a href="https://p6-novel.byteimg.com/origin/' + bookData.book_flight_alias_thumb + '" target="_blank">查看封面</a>' : ''}</p>
+<p>短书名: ${bookData.book_short_name || '无'}</p>
+<p>书籍创建时间: ${moment(bookData.create_time).format('YYYY-MM-DD HH:mm:ss')} (${bookData.create_time})</p>
+<p>分类: ${bookData.category}</p>
+<p>标签: ${bookData.tags}</p>
+<p>读者数: ${formatCount(bookData.read_count)} (${bookData.read_count})</p>
+<p>听书人数: ${formatCount(bookData.listen_count)} (${bookData.listen_count})</p>
+<p>书籍分类: ${bookData.gender ? (['女频', '男频', '出版'][(bookData.gender << 0)] || '未知') : '未知'} (${bookData.gender})</p>
+<p>当前状态: ${['未知', '完结', '连载', null, null, null, '断更'][(bookData.creation_status << 0) + 1] || '未知'} (${bookData.creation_status})</p>
+<p>ISBN: ${bookData.isbn || '书籍无出版数据'}</p>
+<p>${bookData.copyright_info.replace('，如有任何疑问，请通过“我的-意见反馈”告知我们', '')}。</p>
+<hr>
+<h3 align="center">简介</h3>
+<p>${('\u3000\u3000' + bookData.book_abstract_v2.split('\n').join('<br />\u3000\u3000')).replace(/[\u3000]+/g, '\u3000\u3000')}</p>
+<hr>
+<h3 align="center">数据信息</h3>
+<p>听书总时长: ${formatDuration(bookData.duration)} (${bookData.duration}s)</p>
+<p align="center"><strong>以下数据仅供参考</strong></p>
+<p>活跃读者数: ${formatCount(bookData.read_count)} (${bookData.read_count}) | 总读者数: ${formatCount(bookData.read_count_all)} (${bookData.read_count_all}) | 占比: ${(bookData.read_count / bookData.read_count_all * 100).toFixed(3)}%</p>
+<p>总加书架数: ${formatCount(bookData.shelf_cnt_history)} (${bookData.shelf_cnt_history}) | 14日加书架数: ${formatCount(bookData.add_shelf_count_14d)} (${bookData.add_shelf_count_14d}) | 占比: ${(bookData.add_shelf_count_14d / bookData.shelf_cnt_history * 100).toFixed(3)}%</p>
+<hr>
+<h3 align="center">各子平台上线时间</h3>
+<p>没做</p>
+`
+        } catch (error) {
+          console.error('获取书籍详情失败:', error)
+          alert('获取书籍详情失败')
+        }
+      }
+
+      // 分割 Array
+      const chunkArray = (arr, size) => {
+        const result = []
+        for (let i = 0; i < arr.length; i += size) {
+          result.push(arr.slice(i, i + size))
+        }
+        return result
+      }
+
+      // 修复章节带特殊符号的
+      function escapeRegExp(string) {
+        return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      }
+
+      // 高清化封面
+      const replaceCover = u => {
+        if (u.startsWith('https://')) u = u.substring(8)
+        else u = u.substring(7)
+        let uArr = u.split('/')
+        uArr[0] = 'https://p6-novel.byteimg.com/origin'
+        let uArr2 = []
+        uArr.forEach(x => {
+          if (!x.includes('?') && !x.includes('~')) uArr2.push(x)
+          else uArr2.push(x.split('~')[0])
+        })
+        u = uArr2.join('/')
+        return u
+      }
+
+      async function downloadEpub(result, catalog, bookData, progress, cssMap) {
+        const saver = new EpubSaver()
+        let intr = ''
+        await saver.setInfo('bookname', bookData.book_name)
+        intr += `分类：${JSON.parse(bookData.category_v2)
+          .map(item => item.Name)
+          .join('、')}\n`
+        intr += `主角：${JSON.parse(bookData.roles || '[]').join('、')}\n`
+        intr += `简介：${bookData.abstract}\n`
+        intr += `${bookData.copyright_info.replace('，如有任何疑问，请通过“我的-意见反馈”告知我们', '')}。`
+        await saver.setInfo('introduction', intr)
+        await saver.setInfo('author', bookData.author)
+        await saver.setInfo('cover', replaceCover(bookData.thumb_url))
+        // 这个从番茄 APP 里偷出来的
+        await saver.addCSS(
+          0,
+          `html{
+    display:block;
+}
+
+body{
+    display:block;
+}
+
+p{
+    font-size:1em;
+    text-align:justify;
+    display:block;
+    text-indent:2em;
+    margin:0.6em 0em 0.6em 0em;
+}
+
+div{
+    display:block;
+}
+
+h1{
+    display:block;
+    font-size:1.42em;
+    font-weight:bold;
+    margin:22px 0em 3em 0em;
+    text-align:left;
+    line-space:0.5em;
+}
+
+h2{
+    display:block;
+    font-size:1.2em;
+    font-weight:bold;
+    margin:1em 0em 0.6em 0em;
+    text-align:left;
+}
+
+h3{
+    display:block;
+    font-size:1em;
+    font-weight:bold;
+    margin:0em 0em 1em 0em;
+    text-align:left;
+}
+
+sup{
+    font-size:smaller;
+}
+
+.picture{
+    text-indent:0em;
+    text-align:center;
+    margin:0em 0em 0em 0em;
+    line-space:0em;
+}
+
+.pictureDesc{
+    font-size:0.73em;
+    text-indent:0em;
+    margin:0.4em 0em 1em 0em;
+    theme-color:color1#0.7;
+    line-space:0.3em;
+    text-align:left;
+}
+
+.pictureTitle{
+    font-size:0.73em;
+    text-indent:0em;
+    margin:1em 0em 0.3em 0em;
+    theme-color:color1#0.7;
+    text-align:left;
+    line-space:0em;
+}
+
+.collectTitle{
+    margin:80px 68px 0em 0px;
+    font-size:1.42em;
+    text-indent:0em;
+    text-align:left;
+}
+
+.collectAuthor{
+    margin:16px 0em 0em 0em;
+    font-size:1em;
+    text-indent:0em;
+    text-align:left;
+}
+
+.collectPicture{
+    margin:24px 0em 0em 0em;
+    text-indent:0em;
+    text-align:right;
+}
+
+.collectDetail{
+    margin:3em 44px 0em 10px;
+    text-indent:0em;
+}
+
+.quoteDefault{
+    font-size:1em;
+    margin:1.5em 0em 1.5em 2em;
+    font-family:'FZShengShiKaiShuS-M-GB';
+    line-space:0.5em;
+}
+
+.quoteStyle1{
+    text-indent:0em;
+    text-align:left;
+}
+
+.alignRight{
+    text-align:right;
+}
+
+.quoteDefaultAlignRight{
+    font-size:1em;
+    margin:0.6em 0em 1.5em 32px;
+    font-family:'FZShengShiKaiShuS-M-GB';
+    text-align:right;
+    line-space:0.5em;
+}
+.chapterTitle1{
+    display:block;
+    font-size:1.42em;
+    font-weight:bold;
+    margin:22px 0em 3em 0em;
+    text-align:left;
+    line-space:0.5em;
+}
+
+.chapterTitle2{
+    display:block;
+    font-size:1.2em;
+    font-weight:bold;
+    margin:1em 0em 0.6em 0em;
+    text-align:left;
+}
+
+.chapterTitle3{
+    display:block;
+    font-size:1em;
+    font-weight:bold;
+    margin:0em 0em 1em 0em;
+    text-align:left;
+}
+
+.bdFootnote{
+    width:0.69em;
+    height:0.84em;
+    margin-top:-0.23em;
+    vertical-align:top;
+}
+
+.bdPicturebg{
+    break-before:always;
+}`,
+          'Styles/dragon-common.css'
+        )
+        let cssMapIdx
+        if (cssMap && typeof cssMap === 'object') {
+          cssMapIdx = await saver.createCSSMap(cssMap)
+        }
+        let volname = '默认卷'
+        let curvolidx = 0
+        let cursor = 0
+        let currentVolume
+        for (const i of catalog) {
+          if (progress.isCancelled) break
+          const data = result[i.item_id]
+          if (data?.novel_data?.volume_name && volname != data.novel_data.volume_name) {
+            volname = data.novel_data.volume_name
+            currentVolume = await saver.addVolume(volname, curvolidx++)
+            console.log('更换卷', currentVolume)
+          }
+          if (typeof currentVolume === 'undefined') {
+            currentVolume = await saver.addVolume(volname, curvolidx)
+          }
+          const curChapContent = data.content || '<p>正文内容为空</p>'
+          const curChapCSSMap = JSON.parse(data?.novel_data?.css_map || '{}')
+          const curChapterCSSIdx = []
+          if (data?.novel_data?.css_map && cssMapIdx) {
+            for (const top of Object.keys(curChapCSSMap)) {
+              console.log('fileinfo', top)
+              curChapterCSSIdx.push(cssMapIdx[top])
+            }
+          }
+          await currentVolume.addChapter(
+            cursor++,
+            curChapContent,
+            i.title,
+            curChapContent.includes('xhtml') ? 'xhtml' : 'html',
+            curChapContent.includes('<article>'),
+            true,
+            curChapterCSSIdx
+          )
+          progress.updateProgressBar(cursor)
+        }
+        if (progress.isCancelled) return
+        progress.updateTitle('正在生成EPUB...')
+        progress.total = 1
+        progress.updateProgressBar(0)
+        const epub = await saver.save()
+        progress.updateProgressBar(1)
+        progress.updateTitle('执行完成，正在保存')
+        progress.complete(false)
+        const blob = new Blob([epub], { type: 'application/epub+zip' })
+        saveAs(blob, `${bookData.book_name}_${bookData.author}.epub`)
+      }
+
+      // 下载书籍
+      async function downloadBookExecutor() {
+        window.downloadResult = ''
+        const Lock = document.getElementById('download_lock')
+        const charset = document.getElementById('charset-selector').value.toLowerCase()
+        const fileformat = document.getElementById('format-selector').value.toLowerCase()
+        if (fileformat === 'epub' && charset === 'gbk') {
+          alert('EPUB格式仅支持UTF-8编码')
+          return
+        }
+        console.log(charset)
+
+        let taskId = `task_${Date.now()}`
+        console.log(taskId)
+        if (Lock.innerHTML.trim() !== '') {
+          console.warn(Lock.innerHTML.trim() !== '', '下载按钮重复点击')
+          return
+        } else {
+          Lock.innerHTML = taskId
+        }
+
+        const bookId = document.getElementById('book_id').innerHTML
+        if (!bookId) {
+          alert('请先选择一本书籍！')
+          return
+        }
+
+        const catalogUrl = `${apiNode}/catalog?book_id=${bookId}`
+        let catalog
+        let cssMap
+
+        try {
+          const response = await fetch(catalogUrl)
+          const body = await response.json()
+          catalog = body.data?.item_data_list
+          cssMap = body.data?.css_map
+        } catch (error) {
+          console.error('获取目录失败', error)
+        }
+
+        if (!catalog) {
+          alert('获取目录失败或目录为空')
+          console.error(catalog)
+          return
+        }
+
+        let progress = showProgressWindow('下载', catalog.length)
+        progress.updateTitle('准备中...')
+
+        const item_ids = catalog.map(item => item.item_id)
+        const result = {}
+        let cursor = 0
+
+        const maxConcurrentRequests = 32
+
+        const downloadChunks = async () => {
+          const concurrencyLimit = maxConcurrentRequests
+          const totalItems = item_ids.length
+          const retryMap = new Map() // 记录每个item的重试次数
+
+          // 创建异步任务队列
+          const queue = item_ids.map(item_id => ({
+            item_id,
+            status: 'pending',
+            retries: 0,
+          }))
+
+          let activeCount = 0
+          let cursor = 0
+          let hasError = false
+
+          return new Promise(resolve => {
+            const runWorker = async () => {
+              while (queue.length > 0 && !hasError && !progress.isCancelled) {
+                if (activeCount >= concurrencyLimit) return
+
+                const task = queue.shift()
+                if (!task || task.status === 'success') return
+
+                activeCount++
+                let success = false
+
+                try {
+                  while (task.retries <= 3) {
+                    if (progress.isCancelled) break
+
+                    const response = await fetch(`${apiNode}/content?item_id=${task.item_id}`)
+                    const body = await response.json()
+
+                    if (body.data?.content) {
+                      result[task.item_id] = body.data
+                      cursor++
+                      progress.updateProgressBar(cursor)
+                      progress.updateTitle('缓存中... | ' + (catalog[cursor] || {}).title)
+                      success = true
+                      break
+                    } else {
+                      task.retries++
+                      await new Promise(r => setTimeout(r, 300)) // 错误章节等会再下
+                    }
+                  }
+                } catch (error) {
+                  console.error(`item ${task.item_id} failed:`, error)
+                } finally {
+                  activeCount--
+
+                  if (!success) {
+                    // hasError = true;
+                    result[task.item_id] = { error: 'Max retries exceeded' }
+                    console.warn(`Item ${task.item_id} failed after 3 retries`)
+                  }
+
+                  // 立即触发下一个任务
+                  if (!hasError && !progress.isCancelled) {
+                    if (queue.length > 0 || activeCount > 0) {
+                      runWorker()
+                    } else {
+                      resolve(true)
+                    }
+                  }
+                }
+              }
+
+              // 所有任务完成检测
+              if (activeCount === 0 && queue.length === 0) {
+                resolve(!hasError)
+              }
+            }
+
+            // 启动初始并发数
+            for (let i = 0; i < Math.min(concurrencyLimit, queue.length); i++) {
+              runWorker()
+            }
+          })
+        }
+
+        let isSuccess = await downloadChunks()
+        if (!isSuccess) {
+          return
+        }
+
+        console.log(Object.keys(result).length)
+        progress.updateTitle('处理章节中...')
+        cursor = 0
+        progress.updateProgressBar(cursor)
+        let content = ''
+        let bookData = JSON.parse(document.getElementById('book_info').innerHTML)
+
+        if (fileformat === 'epub') return downloadEpub(result, catalog, bookData, progress, cssMap)
+
+        content += bookData.book_name + '\n'
+        content += `作者：${bookData.author}\n`
+        content += `分类：${JSON.parse(bookData.category_v2)
+          .map(item => item.Name)
+          .join('、')}\n`
+        content += `主角：${JSON.parse(bookData.roles || '[]').join('、')}\n`
+        content += `简介：${bookData.abstract}\n`
+        content += `${bookData.copyright_info.replace('，如有任何疑问，请通过“我的-意见反馈”告知我们', '')}。\n\n\n`
+
+        let volname
+        for (let i of catalog) {
+          let data = result[i.item_id]
+          cursor++
+          if (data?.novel_data?.volume_name && volname != data.novel_data.volume_name) {
+            content += `${data.novel_data.volume_name.replace('：默认', '')}\n\n`
+            volname = data.novel_data.volume_name
+          }
+          let text =
+            `${i.title}\n\u3000\u3000` +
+            htmlToTextArray((data?.content || '<p>章节内容为空</p>').replace(new RegExp(escapeRegExp(i.title), 'g'), ''))
+              .join('\n\u3000\u3000')
+              .trim() +
+            '\n\n\n' // .replace(`${i.title}\n\u3000\u3000${i.title}`, i.title) + '\n\n\n';
+          content += text
+          progress.updateProgressBar(cursor)
+        }
+
+        progress.updateTitle('执行完成，正在保存')
+        const file = `${bookData.book_name}_${bookData.author}.txt`
+        window.downloadResult = {
+          content,
+          file,
+        }
+        progress.complete()
+        let encoded = charset === 'gbk' ? encodeGBK(content) : new TextEncoder(charset).encode(content)
+        const blob = new Blob([encoded], { type: `text/plain;charset=${charset}` })
+        saveAs(blob, file)
+        Lock.innerHTML = ''
+      }
+
+      async function downloadBook() {
+        try {
+          await downloadBookExecutor()
+        } catch (e) {
+          console.error(e)
+        }
+      }
+
+      function reSave() {
+        // 检查 window.downloadResult 是否存在
+        if (!window.downloadResult) {
+          console.error('window.downloadResult is not defined.')
+          return
+        }
+
+        alert('请全选新页面内容进行手动保存')
+        // 打开新的空白页面
+        const newWindow = window.open()
+
+        if (newWindow) {
+          newWindow.document.write(`<pre>${window.downloadResult.content}</pre>`) // 显示文本内容
+          newWindow.document.close()
+        } else {
+          console.error('Failed to open a new window.')
+        }
+      }
+
+      function reDownload() {
+        const charset = document.getElementById('charset-selector').value.toLowerCase()
+        let encoded =
+          charset === 'gbk' ? encodeGBK(window.downloadResult.content) : new TextEncoder(charset).encode(window.downloadResult.content)
+        const blob = new Blob([encoded], { type: `text/plain;charset=${charset}` })
+        saveAs(blob, window.downloadResult.file)
+      }
+
+      function getAllTextElements(element, textArray) {
+        // 获取当前元素的所有子节点
+        const childNodes = element.childNodes
+
+        // 遍历每一个子节点
+        childNodes.forEach(node => {
+          // 如果是文本节点，将其内容加入到数组中
+          if (node.nodeType === Node.TEXT_NODE) {
+            textArray.push(node.textContent.trim())
+          } else if (node.nodeType === Node.ELEMENT_NODE) {
+            // 如果是元素节点，递归调用该函数处理其子元素
+            getAllTextElements(node, textArray)
+          }
+        })
+      }
+
+      function htmlToTextArray(html) {
+        // 创建一个div，用于存放html内容
+        const div = document.createElement('div')
+
+        // 修改div的内容为给定的html
+        div.innerHTML = html
+
+        // 获取div中的所有文本内容
+        let textArray = []
+        getAllTextElements(div, textArray)
+
+        return textArray
+      }
+
+      // 已弃用
+      async function multiDownloadExecutor(book_id, item_ids, depth = 0) {
+        if (!item_ids.length) {
+          return {}
+        }
+        if (depth > 3) {
+          alert('下载失败')
+          throw new Error('try max num')
+        }
+        try {
+          const response = await fetch(`${apiNode}/multi-content?book_id=${book_id}&item_ids=${item_ids.join(',')}`)
+          const result = await response.json()
+          // console.log(item_ids, result)
+          return result.data
+        } catch (err) {
+          console.warn('error downloading...', book_id, item_ids, 'retry', depth)
+          return await multiDownloadExecutor(book_id, item_ids, depth + 1)
+        }
+      }
+
+      function showProgressWindow(title, total) {
+        const progressModal = document.getElementById('progress-modal')
+        const progressBarFill = document.getElementById('progress-bar-fill')
+        const progressPercentage = document.getElementById('progress-percentage')
+        const progressCount = document.getElementById('progress-count')
+        const progressTitle = document.getElementById('progress-title')
+        const progressCancelBtn = document.getElementById('progress-cancel')
+        const progressSubmitBtn = document.getElementById('progress-submit')
+        const resaveButton = document.getElementById('button-resave')
+        const redlButton = document.getElementById('button-redownload')
+
+        // 显示进度窗口
+        progressModal.style.display = 'flex'
+        progressTitle.textContent = title
+        progressCount.textContent = `0/${total}`
+        progressPercentage.textContent = '0%'
+        progressBarFill.style.width = '0%'
+
+        let isCancelled = false
+        // 操作对象
+        const obj = {
+          total,
+          title,
+          isCancelled,
+          updateTitle(title) {
+            const progressTitle = document.getElementById('progress-title')
+            progressTitle.textContent = title
+            this.title = title
+          },
+          updateProgressBar(current) {
+            if (this.isCancelled) return
+
+            const percentage = ((current / this.total) * 100).toFixed(2)
+            progressBarFill.style.width = `${percentage}%`
+            progressPercentage.textContent = `${percentage}%`
+            progressCount.textContent = `${current}/${this.total}`
+          },
+          cancel() {
+            this.isCancelled = true
+            progressModal.style.display = 'none'
+            document.getElementById('download_lock').innerHTML = ''
+          },
+          complete(allowResave = true) {
+            progressSubmitBtn.style = ''
+            if (allowResave) {
+              resaveButton.style = ''
+              redlButton.style = ''
+            }
+            progressCancelBtn.style.display = 'none'
+          },
+          finish() {
+            progressModal.style.display = 'none'
+            progressCancelBtn.style = ''
+            progressSubmitBtn.style.display = 'none'
+            redlButton.style.display = 'none'
+            resaveButton.style.display = 'none'
+            document.getElementById('download_lock').innerHTML = ''
+          },
+        }
+
+        // 按钮事件
+        progressCancelBtn.onclick = () => {
+          obj.cancel()
+        }
+        progressSubmitBtn.onclick = () => {
+          obj.finish()
+        }
+
+        return obj
+      }
+
+      async function checkMultiDownloadSupport(bookId, itemId) {
+        try {
+          const response = await fetch(`${apiNode}/multi-content?book_id=${bookId}&item_ids=${itemId}`)
+          const _ = await response.json()
+          console.log(_)
+          if (_.data && _.data.length != 0) {
+            return true
+          }
+          return false
+        } catch (err) {
+          console.warn(err)
+          return false
+        }
+      }
+
+      const bookNameDialog = document.getElementById('internal-alert')
+      bookNameDialog.addEventListener('click', event => {
+        const content = bookNameDialog.querySelector('.internal-alert-container')
+        const rect = content.getBoundingClientRect()
+        const isOutside = event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom
+        if (isOutside) bookNameDialog.close()
+      })
+      document.getElementById('book-title').onclick = () => {
+        bookNameDialog.showModal()
+      }
+
+      const initUrl = new URL(window.location.href)
+      // 自动处理参数
+      if (initUrl.searchParams.get('book_id') || initUrl.searchParams.get('text')) {
+        document.getElementById('search-form').display = 'none'
+        searchBooks(initUrl.searchParams.get('book_id') || initUrl.searchParams.get('text'))
+      }
+
+      console.log(`hello ^(｡･ω･｡)^`)
+      console.log('apiNode', apiNode)
+      console.log('saveAs', saveAs)
+      console.log('encodeGBK', encodeGBK)
+      console.log('EpubSaver', EpubSaver)
+    </script>
+    <style>
+      body {
+        font-family: Arial, sans-serif;
+        margin: 0;
+        padding: 0;
+        background-color: var(--bg-color);
+        color: var(--text-color);
+        transition: background-color 0.3s, color 0.3s;
+      }
+
+      :root {
+        --bg-color: #fff;
+        --text-color: #000;
+        --button-bg: #007bff;
+        --button-text: #fff;
+        --button-hover-bg: #0056b3;
+        --info-bg: #f9f9f9;
+        --download-bg: #28a745;
+        --download-text: #fff;
+        --download-hover-bg: #1e7e34;
+        --toggle-bg: #6c757d;
+        --toggle-text: #fff;
+        --toggle-hover-bg: #5a6268;
+        --jump-text: #8898ff;
+      }
+
+      [data-theme='dark'] {
+        --bg-color: #121212;
+        --text-color: #e0e0e0;
+        --button-bg: #3498db;
+        --button-text: #fff;
+        --button-hover-bg: #2980b9;
+        --info-bg: #1e1e1e;
+        --download-bg: #4caf50;
+        --download-text: #fff;
+        --download-hover-bg: #3e8e41;
+        --toggle-bg: #95a5a6;
+        --toggle-text: #fff;
+        --toggle-hover-bg: #7f8c8d;
+        --jump-text: #c3cbff;
+      }
+
+      #title {
+        text-align: center;
+        padding: 20px;
+      }
+
+      .container {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        padding: 20px;
+      }
+
+      .search-form {
+        display: flex;
+        justify-content: center;
+        /* width: 800px; */
+        margin-bottom: 20px;
+      }
+
+      .search-form input {
+        padding: 10px;
+        font-size: 16px;
+        border: 1px solid #ccc;
+        border-radius: 15px 0 0 15px;
+        /* width: 250px; */
+        /* max-width: 85%; */
+        transition: width 0.3s;
+      }
+
+      .search-form button {
+        padding: 10px 20px;
+        font-size: 16px;
+        border: none;
+        width: 40%;
+        max-width: 80px;
+        background-color: var(--button-bg);
+        color: var(--button-text);
+        border-radius: 0 15px 15px 0;
+        cursor: pointer;
+        transition: background-color 0.3s;
+      }
+      
+      a {
+        color: var(--jump-text);
+      }
+
+      .search-form button:hover {
+        background-color: var(--button-hover-bg);
+      }
+
+      .book-list {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        width: 90%;
+        max-width: 600px;
+      }
+
+      .book-item {
+        display: flex;
+        justify-content: space-between;
+        width: 100%;
+        padding: 10px;
+        border-bottom: 1px solid #ccc;
+        cursor: pointer;
+      }
+
+      .book-item:hover {
+        background-color: #777;
+      }
+
+      .book-info {
+        display: none;
+        flex-direction: row;
+        border: 1px solid #ccc;
+        border-radius: 10px;
+        padding: 20px;
+        width: 60%;
+        background-color: var(--info-bg);
+        box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+        margin-top: 20px;
+        transition: background-color 0.3s;
+      }
+
+      .book-info img {
+        display: flex;
+        max-width: 40%;
+        border-radius: 10px;
+        margin-right: 20px;
+      }
+
+      .book-info h2 {
+        margin: 0 0 10px;
+      }
+
+      .book-info p {
+        margin: 5px 0;
+        text-align: justify;
+      }
+
+      .book-info .download-btn {
+        padding: 10px 20px;
+        font-size: 16px;
+        border: none;
+        background-color: var(--download-bg);
+        color: var(--download-text);
+        border-radius: 5px;
+        cursor: pointer;
+        transition: background-color 0.3s;
+      }
+
+      .book-info .download-btn:hover {
+        background-color: var(--download-hover-bg);
+      }
+
+      .book-info .charset-selector {
+        padding: 10px 20px;
+        font-size: 16px;
+        border: none;
+        background-color: var(--download-bg);
+        color: var(--download-text);
+        border-radius: 5px;
+      }
+
+      .internal-alert {
+        outline: none;
+        border: 1px solid #ccc;
+        box-shadow: 0 0 20px rgba(0, 0, 0, 0.2);
+        width: 75%;
+        height: 55%;
+        background: var(--bg-color);
+        border-radius: 8px;
+      }
+      .internal-alert-container {
+        position: relative;
+        width: 100%;
+        height: 100%;
+        color: var(--text-color);
+        /*
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        */
+      }
+
+      .toggle-theme {
+        position: fixed;
+        top: 20px;
+        right: 20px;
+        padding: 10px;
+        font-size: 16px;
+        border: none;
+        background-color: var(--toggle-bg);
+        color: var(--toggle-text);
+        border-radius: 5px;
+        cursor: pointer;
+        transition: background-color 0.3s;
+      }
+
+      .toggle-theme:hover {
+        background-color: var(--toggle-hover-bg);
+      }
+
+      .book-info-container {
+        flex: 1;
+      }
+
+      @media (orientation: portrait) {
+        .internal-alert {
+          height: 75% !important;
+        }
+        .book-info {
+          width: 90%;
+          flex-direction: column;
+        }
+        .book-info img {
+          max-width: 100%;
+          border-radius: 10px;
+          margin-bottom: 10px;
+        }
+      }
+
+      .progress-modal {
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        background: rgba(0, 0, 0, 0.5);
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        z-index: 1000;
+      }
+
+      .progress-box {
+        background: var(--bg-color);
+        padding: 20px;
+        border-radius: 8px;
+        text-align: center;
+        width: 300px;
+      }
+
+      .progress-title {
+        position: relative;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        width: 100%;
+      }
+
+      .progress-bar {
+        width: 100%;
+        background: #f3f3f3;
+        border-radius: 4px;
+        overflow: hidden;
+        margin-bottom: 10px;
+      }
+
+      .progress-bar-fill {
+        height: 20px;
+        background: #4caf50;
+        width: 0%;
+        transition: width 0.2s;
+      }
+
+      .progress-text {
+        margin-bottom: 10px;
+      }
+
+      .progress-cancel {
+        padding: 5px 10px;
+        background: #ff5722;
+        color: white;
+        border: none;
+        border-radius: 4px;
+        cursor: pointer;
+      }
+
+      .button-resave,
+      .button-redownload,
+      .progress-submit {
+        padding: 5px 10px;
+        background: var(--download-bg);
+        color: white;
+        border: none;
+        border-radius: 4px;
+        cursor: pointer;
+        transition: background-color 0.3s;
+      }
+
+      .button-resave:hover,
+      .button-redownload:hover,
+      .progress-submit:hover {
+        background: var(--download-hover-bg);
+      }
+      
+      .footer {
+        width: 100%;
+        display: flex;
+        justify-content: center;
+      }
+
+      .about-container {
+        text-align: center;
+        max-width: 75%;
+      }
+
+      .about-text {
+        color: #878787;
+        margin: 0;
+      }
+    </style>
+  </body>
+</html>
