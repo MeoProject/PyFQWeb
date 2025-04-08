@@ -37,7 +37,7 @@ pm2 start npm --name "pyfqweb" -- start
 | 搜索     | `/search`                                | GET       | `query`: 关键词<br>`offset=0`: 分页偏移量（计算式：(page-1)*10）<br>`tab_type=3`: 搜索类型（默认书籍）           |
 | 书籍元数据 | `/info`<br>`/detail`                   | GET       | `book_id`: 书籍唯一标识符                                                |
 | 目录结构 | `/catalog`<br>`/directory/all_items`    | GET       | `book_id`: 书籍唯一标识符                                                |
-| 内容获取 | `/content`                              | GET       | `item_id`: 章节ID<br>`text_type=false`: [bool]纯文本模式<br>`image_mode=true`: [bool]图片包含 |
+| 内容获取 | `/content`                              | GET       | `item_id`: 章节ID<br>`text_mode=false`: [bool]纯文本模式<br>`image_mode=true`: [bool]图片包含 |
 | 批量操作 | `/multi-content`<br>`/multi-detail`     | GET       | `book_id`: 书籍ID（必须）<br>`item_ids`: 逗号分隔的ID列表（仅multi-content）                        |
 | 正文预览 | `/item-summary`                         | GET       | `book_id`: 书籍ID<br>`item_ids`: 逗号分隔的章节ID列表                   |
 | 听书服务 | `/audio`                                | GET       | `item_ids`: 音频ID列表                                                   |
