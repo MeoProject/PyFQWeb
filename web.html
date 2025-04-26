@@ -601,6 +601,10 @@
     <h1 id="title">小说搜索与下载</h1>
     <div id="container" class="container">
       <form class="search-form" id="search-form">
+        <select id="search-type" class="search-type">
+          <option value="book">书籍</option>
+          <option value="audio">听书</option>
+        </select>
         <input type="text" id="book-search" placeholder="请输入小说名称" />
         <button type="button" onclick="searchBooks()">
           <svg xmlns="http://www.w3.org/2000/svg" fill="currentColor" width="24" height="24" viewBox="0 0 24 24" display="inherit">
@@ -622,6 +626,10 @@
           <p><strong>最新章节：</strong><span id="latest-chapter"></span> <span id="latest-chapter-passtime"></span></p>
           <p id="book-description"></p>
           <button class="download-btn" onclick="downloadBook()">下载</button>
+          <select id="type-selector" class="charset-selector">
+            <option value="text">文本</option>
+            <option value="audio">音频</option>
+          </select>
           <select id="charset-selector" class="charset-selector">
             <option value="utf-8">UTF-8</option>
             <option value="gbk">GBK</option>
@@ -644,6 +652,13 @@
           <p id="progress-percentage">0%</p>
           <p id="progress-count">0/0</p>
         </div>
+        <div id="sub-progress" style="display: none">
+          <div class="progress-bar">
+            <div id="sub-progress-bar-fill" class="progress-bar-fill"></div>
+          </div>
+          <p id="sub-progress-title" class="progress-text">副标题</p>
+        </div>
+        </p>
         <button id="progress-cancel" class="progress-cancel">取消</button>
         <button id="progress-submit" class="progress-submit" style="display: none">确定</button>
         <button id="button-resave" class="button-resave" style="display: none" onclick="reSave()">手动保存</button>
@@ -663,8 +678,12 @@
       </div>
     </div>
     <script>
-      const apiNode = ''
+      const apiNode = 'https://api.v2.sukimon.me:45598'
       if (!apiNode) alert('请配置apiNode后再使用网页（需要支持跨域）')
+
+      function sleep(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+      }
 
       // 设置页面主题
       function setTheme(theme) {
@@ -785,6 +804,11 @@
       // 搜索书籍
       async function searchBooks(k) {
         const query = k || document.getElementById('book-search').value.trim()
+        const type = document.getElementById('search-type').value || 'book'
+        const typeMap = {
+          book: 3,
+          audio: 2,
+        }
         if (!query) {
           return
         }
@@ -793,14 +817,14 @@
           return await showBookInfo(_book_id)
         }
         const offset = 0 // 默认偏移量
-        const tabType = 3 // 默认搜索类型为书籍
+        const tabType = typeMap[type]
         const url = `${apiNode}/search?query=${query}&offset=${offset}&tab_type=${tabType}`
 
         try {
           const response = await fetch(url)
           const data = await response.json()
           // console.log(data)
-          const resp = data.search_tabs.find(tab => tab.tab_type === 3)?.data || []
+          const resp = data.search_tabs.find(tab => tab.tab_type === typeMap[type])?.data || []
           let searchResults = []
           for (let i of resp) {
             let obj = (i.book_data || [])[0]
@@ -1196,6 +1220,7 @@ sup{
         if (!catalog) {
           alert('获取目录失败或目录为空')
           console.error(catalog)
+          Lock.innerHTML = ''
           return
         }
 
@@ -1343,9 +1368,167 @@ sup{
         Lock.innerHTML = ''
       }
 
-      async function downloadBook() {
+      async function getCORSAvailableAudioURL(item_id, tone_id, try_num = 0) {
+        if (try_num > 3) {
+          throw new Error('try max num')
+        }
         try {
-          await downloadBookExecutor()
+          const apiUrl = `${apiNode}/audio?item_ids=${item_id}`
+          const response = await fetch(apiUrl)
+          const body = await response.json()
+          const item = body.data[0]
+          let urls = [item.main_url, item.backup_url]
+          urls = urls.filter(_ => !_.includes('://v3-'))
+          return urls[0] || getCORSAvailableAudioURL(item_id, tone_id, try_num++)
+        } catch(e) {
+          console.error(e)
+          return getCORSAvailableAudioURL(item_id, tone_id, try_num++)
+        }
+      }
+
+      async function downloadAudioExecutor() {
+        const tone_id = prompt('部分浏览器会弹出警告，网页尝试下载多个文件，请允许请求！\n请输入音色ID（对于番茄畅听类真人朗读，这个值会被忽略）: ', '1')
+        window.downloadResult = ''
+        const Lock = document.getElementById('download_lock')
+
+        let taskId = `task_${Date.now()}`
+        console.log(taskId)
+        if (Lock.innerHTML.trim() !== '') {
+          console.warn(Lock.innerHTML.trim() !== '', '下载按钮重复点击')
+          return
+        } else {
+          Lock.innerHTML = taskId
+        }
+
+        const bookId = document.getElementById('book_id').innerHTML
+        if (!bookId) {
+          alert('请先选择一本书籍！')
+          return
+        }
+
+        let catalog
+        const catalogUrl = `${apiNode}/catalog?book_id=${bookId}`
+        try {
+          const response = await fetch(catalogUrl)
+          const body = await response.json()
+          catalog = body.data?.item_data_list
+        } catch (error) {
+          console.error('获取目录失败', error)
+        }
+
+        if (!catalog) {
+          alert('获取目录失败或目录为空')
+          console.error(catalog)
+          Lock.innerHTML = ''
+          return
+        }
+      
+        const progress = showProgressWindow('下载', catalog.length, true);
+        progress.updateTitle('准备中...');
+        progress.subProgress.updateTitle('准备中');
+        
+        // 添加取消监听
+        let activeXHR = null;
+        progress.onCancel = () => {
+          if (activeXHR) {
+            activeXHR.abort();
+            activeXHR = null;
+          }
+          Lock.innerHTML = '';
+        };
+      
+        try {
+          for (let index = 0; index < catalog.length; index++) {
+            // 检查取消状态
+            if (progress.isCancelled) {
+              console.warn('aborting...')
+              break;
+            }
+      
+            const item = catalog[index];
+            
+            // 更新主进度
+            progress.updateProgressBar(index);
+            progress.updateTitle(`缓存中: ${item.title}`);
+            
+            // 重置副进度
+            progress.subProgress.updateProgressBar(0);
+            progress.subProgress.updateTitle('等待开始...');
+      
+            // 获取下载链接
+            const aurl = await getCORSAvailableAudioURL(item.item_id, tone_id).catch(() => null);
+            if (!aurl) {
+              console.error('目录', item.item_id, item.title, '解析失败');
+              continue;
+            }
+
+            // 创建下载任务
+            const { promise, xhr } = createDownloadTask(aurl, item, progress);
+            activeXHR = xhr; // 保存当前XHR引用
+
+            try {
+              await promise;
+              progress.updateProgressBar(index + 1);
+            } catch (e) {
+              if (e.name !== 'AbortError') {
+                console.error(`下载失败: ${item.title}`, e);
+              }
+              if (progress.isCancelled) break;
+            }
+          }
+        } finally {
+          activeXHR = null;
+          if (!progress.isCancelled) {
+            progress.updateTitle('完成');
+          }
+          progress.complete(false);
+          Lock.innerHTML = '';
+        }
+      }
+
+      // 创建下载任务
+      function createDownloadTask(url, item, progress) {
+        let xhr = null;
+        
+        const promise = new Promise((resolve, reject) => {
+          // 独立进度回调
+          const callback = {
+            ptext: '',
+            stext: '',
+            onProgress(recv, total) {
+              this.ptext = `${formatSize(recv)}/${formatSize(total)}`;
+              progress.subProgress.updateProgressBar(Math.ceil(recv / total * 100));
+              progress.subProgress.updateTitle(`${this.ptext} | ${this.stext}`);
+            },
+            onNetSpeed(bps) {
+              this.stext = formatSpeed(bps);
+              progress.subProgress.updateTitle(`${this.ptext} | ${this.stext}`);
+            },
+            onComplete: resolve,
+            onError: reject
+          };
+      
+          xhr = downloadFile(url, `${item.title}.mp3`, callback);
+        });
+      
+        return { promise, xhr };
+      }
+
+      async function downloadBook() {
+        const typeSelector = document.getElementById('type-selector')
+        const dlType = typeSelector.value || 'text'
+        try {
+          switch (dlType) {
+            case 'text':
+              return await downloadBookExecutor()
+              break
+            case 'audio':
+              return await downloadAudioExecutor()
+              break
+            default:
+              console.error('Unknown download type: ', dlType)
+              return
+          }
         } catch (e) {
           console.error(e)
         }
@@ -1428,7 +1611,7 @@ sup{
         }
       }
 
-      function showProgressWindow(title, total) {
+      function showProgressWindow(title, total, showSubProgress) {
         const progressModal = document.getElementById('progress-modal')
         const progressBarFill = document.getElementById('progress-bar-fill')
         const progressPercentage = document.getElementById('progress-percentage')
@@ -1438,6 +1621,9 @@ sup{
         const progressSubmitBtn = document.getElementById('progress-submit')
         const resaveButton = document.getElementById('button-resave')
         const redlButton = document.getElementById('button-redownload')
+        const subProgressModal = document.getElementById('sub-progress')
+        const subProgressBarFill = document.getElementById('sub-progress-bar-fill')
+        const subProgressTitle = document.getElementById('sub-progress-title')
 
         // 显示进度窗口
         progressModal.style.display = 'flex'
@@ -1445,13 +1631,28 @@ sup{
         progressCount.textContent = `0/${total}`
         progressPercentage.textContent = '0%'
         progressBarFill.style.width = '0%'
+        if (showSubProgress) {
+          subProgressModal.style = ''
+        } else {
+          // 必须要加这一步，不然第二次下载不显示副进度条的时候会显示一个空的副进度条
+          subProgressModal.style.display = 'none'
+        }
 
         let isCancelled = false
         // 操作对象
+        const subProgress = {
+          updateTitle(title) {
+            subProgressTitle.textContent = title
+          },
+          updateProgressBar(fillPercent) {
+            subProgressBarFill.style.width = `${fillPercent}%`
+          }
+        }
         const obj = {
           total,
           title,
           isCancelled,
+          subProgress,
           updateTitle(title) {
             const progressTitle = document.getElementById('progress-title')
             progressTitle.textContent = title
@@ -1469,6 +1670,7 @@ sup{
             this.isCancelled = true
             progressModal.style.display = 'none'
             document.getElementById('download_lock').innerHTML = ''
+            subProgressModal.style.display = 'none'
           },
           complete(allowResave = true) {
             progressSubmitBtn.style = ''
@@ -1477,6 +1679,7 @@ sup{
               redlButton.style = ''
             }
             progressCancelBtn.style.display = 'none'
+            subProgressModal.style.display = 'none'
           },
           finish() {
             progressModal.style.display = 'none'
@@ -1511,6 +1714,118 @@ sup{
         } catch (err) {
           console.warn(err)
           return false
+        }
+      }
+
+      function downloadFile(url, filename, callback) {
+        return new Promise((resolve, reject) => {
+          // 参数标准化处理
+          if (typeof filename === 'object' || typeof filename === 'function') {
+            callback = filename;
+            filename = null;
+          }
+          callback = callback || {};
+      
+          const xhr = new XMLHttpRequest();
+          xhr.open('GET', url, true);
+          xhr.responseType = 'blob';
+          xhr.withCredentials = false;
+      
+          let currentLoaded = 0;
+          let lastLoaded = 0;
+          let lastTime = Date.now();
+          let netSpeedTimer = null;
+      
+          xhr.onprogress = (event) => {
+            currentLoaded = event.loaded;
+            callback.onProgress?.(event.loaded, event.lengthComputable ? event.total : 0);
+          };
+      
+          netSpeedTimer = setInterval(() => {
+            const now = Date.now();
+            const timeDiff = (now - lastTime) / 1000;
+            if (timeDiff > 0) {
+              const speed = (currentLoaded - lastLoaded) / timeDiff;
+              callback.onNetSpeed?.(speed);
+              lastLoaded = currentLoaded;
+              lastTime = now;
+            }
+          }, 500);
+      
+          // 修改完成处理
+          xhr.onload = () => {
+            clearInterval(netSpeedTimer);
+            if (xhr.status >= 200 && xhr.status < 300) {
+              try {
+                const blob = xhr.response;
+                const urlObject = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = urlObject;
+                a.download = filename || getFilenameFromHeaders(xhr) || getFilenameFromUrl(url);
+                document.body.appendChild(a);
+                a.click();
+                setTimeout(() => {
+                  document.body.removeChild(a);
+                  URL.revokeObjectURL(urlObject);
+                  callback.onComplete?.();
+                  resolve();
+                }, 300); // 延长确保点击完成
+              } catch (e) {
+                callback.onError?.(e);
+                reject(e);
+              }
+            } else {
+              handleError(new Error(`HTTP Error ${xhr.status}`));
+            }
+          };
+      
+          // 统一错误处理
+          const handleError = (e) => {
+            clearInterval(netSpeedTimer);
+            callback.onError?.(e);
+            reject(e);
+          };
+      
+          // 添加中止监听
+          xhr.onabort = () => handleError(new DOMException('Aborted', 'AbortError'));
+          xhr.onerror = (e) => handleError(e);
+      
+          xhr.send();
+          return xhr; // 返回XHR对象用于取消
+        });
+      }
+
+      // 从响应头获取文件名
+      function getFilenameFromHeaders(xhr) {
+        try {
+          const disposition = xhr.getResponseHeader('Content-Disposition') || '';
+          const filename = disposition.split('filename=')[1]?.split(/[;,\r\n]/)[0];
+          return filename ? filename.replace(/^['"]|['"]$/g, '') : null;
+        } catch {
+          return null;
+        }
+      }
+      
+      function formatSize(bytes) {
+        if (bytes === 0) return '0 B'
+        const units = ['B', 'KB', 'MB', 'GB']
+        const i = Math.floor(Math.log(bytes) / Math.log(1024))
+        return `${(bytes / Math.pow(1024, i)).toFixed(1)} ${units[i]}`
+      }
+      
+      function formatSpeed(bytesPerSecond) {
+        if (bytesPerSecond > 1024 * 1024) {
+          return `${(bytesPerSecond / 1024 / 1024).toFixed(2)} MB/s`
+        }
+        return `${(bytesPerSecond / 1024).toFixed(2)} KB/s`
+      }
+
+      // 从URL路径获取文件名
+      function getFilenameFromUrl(url) {
+        try {
+          return new URL(url).pathname.split('/').pop() || 'download';
+        } catch {
+          return 'download';
         }
       }
 
@@ -1603,7 +1918,7 @@ sup{
         padding: 10px;
         font-size: 16px;
         border: 1px solid #ccc;
-        border-radius: 15px 0 0 15px;
+        border-radius: 0 0 0 0;
         /* width: 250px; */
         /* max-width: 85%; */
         transition: width 0.3s;
@@ -1621,7 +1936,20 @@ sup{
         cursor: pointer;
         transition: background-color 0.3s;
       }
-      
+
+      .search-form select {
+        padding: 0 5px;
+        font-size: 16px;
+        border: none;
+        width: 40%;
+        min-width: 70px;
+        background-color: var(--button-bg);
+        color: var(--button-text);
+        border-radius: 15px 0 0 15px;
+        transition: background-color 0.3s;
+        text-align: left;
+      }
+
       a {
         color: var(--jump-text);
       }
