@@ -3,7 +3,7 @@
 [![Project Status: Archived - 项目因不可抗力因素已停止开源维护](https://img.shields.io/badge/status-archived-red.svg)](https://example.com)
 
 > ⚠️ **项目状态通告**  
-> 因不可抗力因素影响，本项目自即日起停止开源维护，仓库仅保留基础框架文件供技术研究参考。
+> 因不可抗力因素影响，本项目自即日起停止开源维护，仓库仅保留基础框架文件及非核心衍生项目源码供技术研究参考。
 
 ## 项目背景
 本项目为 [番茄Web模块](https://github.com/fengyuecanzhu/FQWeb)（原项目已删除）的 Python 重构实现，在完整保留原有功能和接口的基础上进行扩展。
