@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="referrer" content="no-referrer">
+    <meta name="referrer" content="no-referrer" />
     <title>小说搜索与下载</title>
     <script id="FileSaver.js" src="https://s4.zstatic.net/ajax/libs/FileSaver.js/2.0.5/FileSaver.min.js"></script>
     <!-- 自己把下面两行取消注释启用移动端开发者工具 -->
@@ -74,511 +74,780 @@
       'use strict'
       class EpubSaver {
         constructor() {
-          this.resources = new Map()
-          this.resourceUrls = new Map()
-          this.volumes = []
-          this.cssList = []
+          this.zip = new JSZip()
+          this.metadata = new Map()
+          this.volumes = new Map()
+          this.cssFiles = new Map()
           this.cssMap = new Map()
-          this.info = {}
-          this.uuid = this.generateUUID()
-          this.resourceCounters = { image: 0, css: 0, other: 0 }
+          this.cssPathMapping = new Map() // Maps original CSS paths to final EPUB paths
+          this.images = new Map() // Store downloaded images: filename -> {buffer, extension}
+          this.coverBuffer = null
+          this.coverExtension = null
+
+          // Set default metadata
+          this.setInfo('identifier', crypto.randomUUID(), { scheme: 'uuid' })
+          this.setInfo('date', moment().format('YYYY-MM-DDTHH:mm:ss[Z]'), { 'opf:event': 'modification' })
+          this.setInfo('language', 'en')
+          this.setInfo('title', 'Untitled Book')
+          this.setInfo('creator', 'Unknown Author')
         }
 
-        generateUUID() {
-          return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
-            const r = (Math.random() * 16) | 0,
-              v = c === 'x' ? r : (r & 0x3) | 0x8
-            return v.toString(16)
-          })
+        async setInfo(key, value, options = {}) {
+          this.metadata.set(key, { value, options })
         }
 
-        async setInfo(tag, value) {
-          if (tag === 'cover') {
-            if (typeof value === 'string') {
-              const response = await fetch(value)
-              const blob = await response.blob()
-              const arrayBuffer = await blob.arrayBuffer()
-              value = new Uint8Array(arrayBuffer)
+        async cover(input) {
+          if (typeof input === 'string') {
+            // It's a URL, fetch it
+            try {
+              const response = await fetch(input)
+              if (!response.ok) {
+                throw new Error(`Failed to fetch cover: ${response.statusText}`)
+              }
+              this.coverBuffer = await response.arrayBuffer()
+
+              // Determine extension from content type or URL
+              const contentType = response.headers.get('content-type')
+              if (contentType) {
+                if (contentType.includes('jpeg') || contentType.includes('jpg')) {
+                  this.coverExtension = 'jpg'
+                } else if (contentType.includes('png')) {
+                  this.coverExtension = 'png'
+                } else if (contentType.includes('gif')) {
+                  this.coverExtension = 'gif'
+                } else {
+                  this.coverExtension = 'jpg' // default
+                }
+              } else {
+                // Try to determine from URL
+                const ext = input.split('.').pop().toLowerCase()
+                this.coverExtension = ['jpg', 'jpeg', 'png', 'gif'].includes(ext) ? ext : 'jpg'
+              }
+            } catch (error) {
+              throw new Error(`Failed to fetch cover image: ${error.message}`)
             }
-            this.info.cover = value
           } else {
-            this.info[tag] = value
+            // It's a buffer
+            this.coverBuffer = input
+            this.coverExtension = 'jpg' // default, could be enhanced to detect type
           }
         }
 
-        addVolume(title, idx) {
-          const volume = new Volume(this, title, idx)
-          this.volumes.push(volume)
+        async addVolume(idx, title) {
+          const volume = new EpubVolume(idx, title, this)
+          this.volumes.set(idx, volume)
           return volume
         }
 
-        async addCSS(idx, content, filename, mapname) {
-          let cssContent = content
-
-          if (typeof content === 'string' && /^https?:\/\//.test(content)) {
-            const response = await fetch(content)
-            cssContent = await response.text()
+        async addCSS(idx, content, mappath) {
+          if (this.cssFiles.has(idx) && mappath && this.cssFiles.get(idx).mappath !== mappath) {
+            throw new Error(`CSS index ${idx} already exists with different mappath`)
           }
 
-          cssContent = await this.processCSSUrls(cssContent)
-
-          if (!filename) {
-            filename = `Styles/style${this.resourceCounters.css++}.css`
-          }
-
-          this._addResource(filename, new TextEncoder().encode(cssContent))
-          this.cssList.push({ idx, filename, mapname })
-
-          if (mapname) {
-            this.cssMap.set(mapname, idx)
-          }
-
-          return idx
+          this.cssFiles.set(idx, { content, mappath })
         }
 
-        async processCSSUrls(css) {
-          const urlRegex = /url\(\s*['"]?(.*?)['"]?\s*\)/g
-          const replacements = []
+        async addCSSMap(pathMap) {
+          for (const [originalPath, urlOrContent] of Object.entries(pathMap)) {
+            // Normalize the original path (remove leading "Styles/" if present)
+            const normalizedOriginal = originalPath.startsWith('Styles/') ? originalPath.substring(7) : originalPath
 
-          let match
-          while ((match = urlRegex.exec(css)) !== null) {
-            const url = match[1]
-            if (!this.resourceUrls.has(url)) {
+            // Create final EPUB path (always under Styles/)
+            const finalPath = normalizedOriginal
+
+            // Store the mapping for reference updates
+            this.cssPathMapping.set(originalPath, `../Styles/${finalPath}`)
+
+            if (typeof urlOrContent === 'string' && urlOrContent.startsWith('http')) {
+              // It's a URL, fetch it
               try {
-                const response = await fetch(url)
-                const blob = await response.blob()
-                const arrayBuffer = await blob.arrayBuffer()
-                const ext = url.split('.').pop().split(/[#?]/)[0] || 'bin'
-                const filename = `resources/res${this.resourceCounters.other++}.${ext}`
-                this._addResource(filename, new Uint8Array(arrayBuffer))
-                this.resourceUrls.set(url, filename)
-              } catch (e) {
-                console.warn('Failed to fetch CSS resource:', url)
+                const response = await fetch(urlOrContent)
+                if (!response.ok) {
+                  throw new Error(`Failed to fetch CSS from ${urlOrContent}: ${response.statusText}`)
+                }
+                const content = await response.text()
+                this.cssMap.set(finalPath, content)
+              } catch (error) {
+                throw new Error(`Failed to fetch CSS: ${error.message}`)
+              }
+            } else {
+              // It's content
+              this.cssMap.set(finalPath, urlOrContent)
+            }
+          }
+        }
+
+        async _processCSSLinksInContent(content) {
+          if (typeof content !== 'string') return content
+
+          // Decode Unicode escape sequences if present
+          let decodedContent = content
+          try {
+            decodedContent = JSON.parse('"' + content.replace(/"/g, '\\"') + '"')
+          } catch (error) {
+            // If JSON parsing fails, use original content
+            decodedContent = content
+          }
+
+          try {
+            const parser = new DOMParser()
+            let doc
+
+            // Try to parse as HTML first
+            if (decodedContent.includes('<html') || decodedContent.includes('<!DOCTYPE')) {
+              doc = parser.parseFromString(decodedContent, 'text/html')
+            } else {
+              // Wrap fragment in temporary HTML for parsing
+              const wrapped = `<html><head></head><body>${decodedContent}</body></html>`
+              doc = parser.parseFromString(wrapped, 'text/html')
+            }
+
+            const cssLinks = doc.querySelectorAll('link[rel="stylesheet"], link[type="text/css"]')
+
+            for (const link of cssLinks) {
+              const href = link.getAttribute('href')
+              if (href) {
+                // Check if this CSS path is in our mapping
+                if (this.cssPathMapping.has(href)) {
+                  // Update to mapped path
+                  const mappedPath = this.cssPathMapping.get(href)
+                  link.setAttribute('href', mappedPath)
+                  console.log(`Updated CSS reference: ${href} -> ${mappedPath}`)
+                } else {
+                  // CSS not in map, warn and remove the link
+                  console.warn(`CSS reference not found in CSSMap, removing: ${href}`)
+                  link.remove()
+                }
               }
             }
-            replacements.push([url, this.resourceUrls.get(url) || url])
-          }
 
-          return replacements.reduce(
-            (acc, [url, path]) => acc.replace(new RegExp(url.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), path),
-            css
-          )
+            // Return updated content
+            if (decodedContent.includes('<html') || decodedContent.includes('<!DOCTYPE')) {
+              const serializer = new XMLSerializer()
+              return serializer.serializeToString(doc.documentElement)
+            } else {
+              // Extract just the body content for fragments
+              return doc.body.innerHTML
+            }
+          } catch (error) {
+            console.warn('Error processing CSS links in content:', error)
+            return decodedContent
+          }
         }
 
-        async createCSSMap(map) {
-          const results = {}
-          let maxIdx = Math.max(...this.cssList.map(c => c.idx), 0)
+        async _downloadImagesFromContent(content) {
+          if (typeof content !== 'string') return content
 
-          for (const [mapname, content] of Object.entries(map)) {
-            const idx = ++maxIdx
-            await this.addCSS(idx, content, mapname, mapname)
-            results[mapname] = idx
+          // Decode Unicode escape sequences if present (content might already be decoded by CSS processing)
+          let decodedContent = content
+          if (content.includes('\\u')) {
+            try {
+              decodedContent = JSON.parse('"' + content.replace(/"/g, '\\"') + '"')
+            } catch (error) {
+              // If JSON parsing fails, use original content
+              decodedContent = content
+            }
           }
 
-          return results
+          try {
+            const parser = new DOMParser()
+            let doc
+
+            // Try to parse as HTML first
+            if (decodedContent.includes('<html') || decodedContent.includes('<!DOCTYPE')) {
+              doc = parser.parseFromString(decodedContent, 'text/html')
+            } else {
+              // Wrap fragment in temporary HTML for parsing
+              const wrapped = `<html><body>${decodedContent}</body></html>`
+              doc = parser.parseFromString(wrapped, 'text/html')
+            }
+
+            const images = doc.querySelectorAll('img[src]')
+            let imageCounter = this.images.size
+
+            for (const img of images) {
+              const src = img.getAttribute('src')
+
+              // Only process external URLs (http/https)
+              if (src && (src.startsWith('http://') || src.startsWith('https://'))) {
+                let downloadSuccess = false
+                let finalUrl = src
+
+                // Try to upgrade HTTP to HTTPS to prevent mixed content errors
+                if (src.startsWith('http://')) {
+                  const httpsUrl = src.replace('http://', 'https://')
+                  try {
+                    console.log(`Trying HTTPS upgrade for: ${src}`)
+                    const httpsResponse = await fetch(httpsUrl)
+                    if (httpsResponse.ok) {
+                      console.warn(`Successfully upgraded HTTP to HTTPS: ${src} -> ${httpsUrl}`)
+                      finalUrl = httpsUrl
+                    }
+                  } catch (error) {
+                    // HTTPS failed, will try original HTTP URL
+                    console.log(`HTTPS upgrade failed for ${src}, trying original URL`)
+                  }
+                }
+
+                // Try downloading the image
+                try {
+                  console.log(`Downloading image: ${finalUrl}`)
+                  const response = await fetch(finalUrl)
+                  if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}: ${response.statusText}`)
+                  }
+
+                  const buffer = await response.arrayBuffer()
+
+                  // Determine file extension
+                  let extension = 'jpg' // default
+                  const contentType = response.headers.get('content-type')
+                  if (contentType) {
+                    if (contentType.includes('png')) extension = 'png'
+                    else if (contentType.includes('gif')) extension = 'gif'
+                    else if (contentType.includes('webp')) extension = 'webp'
+                    else if (contentType.includes('svg')) extension = 'svg'
+                  } else {
+                    // Try to get extension from URL
+                    const urlExt = finalUrl.split('.').pop().toLowerCase().split('?')[0]
+                    if (['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg'].includes(urlExt)) {
+                      extension = urlExt
+                    }
+                  }
+
+                  // Generate unique filename
+                  const filename = `image_${imageCounter++}.${extension}`
+
+                  // Store image
+                  this.images.set(filename, {
+                    buffer,
+                    extension,
+                    originalUrl: src,
+                  })
+
+                  // Update img src to point to local file
+                  img.setAttribute('src', `../Images/${filename}`)
+                  downloadSuccess = true
+                } catch (error) {
+                  console.warn(`Failed to download image ${finalUrl}:`, error.message)
+                }
+
+                // If download failed, remove the img tag entirely
+                if (!downloadSuccess) {
+                  console.warn(`Removing failed image tag: ${src}`)
+                  img.remove()
+                }
+              }
+            }
+
+            // Return updated content
+            if (decodedContent.includes('<html') || decodedContent.includes('<!DOCTYPE')) {
+              const serializer = new XMLSerializer()
+              return serializer.serializeToString(doc.documentElement)
+            } else {
+              // Extract just the body content for fragments
+              return doc.body.innerHTML
+            }
+          } catch (error) {
+            console.warn('Error processing images in content:', error)
+            return decodedContent
+          }
         }
 
-        _addResource(path, content) {
-          if (!this.resources.has(path)) {
-            this.resources.set(path, content)
+        _generateContainer() {
+          return `<?xml version="1.0" encoding="UTF-8"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+    <rootfiles>
+        <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
+    </rootfiles>
+</container>`
+        }
+
+        _generateContentOpf() {
+          const uuid = this.metadata.get('identifier')?.value || crypto.randomUUID()
+          const title = this.metadata.get('title')?.value || 'Untitled Book'
+          const creator = this.metadata.get('creator')?.value || 'Unknown Author'
+          const language = this.metadata.get('language')?.value || 'en'
+          const date = this.metadata.get('date')?.value || moment().format('YYYY-MM-DDTHH:mm:ss[Z]')
+
+          let metadata = ''
+          if (this.coverBuffer) {
+            metadata += '        <meta name="cover" content="cover-image" />\n'
+          }
+          for (const [key, data] of this.metadata) {
+            const optionsStr = Object.entries(data.options)
+              .map(([k, v]) => `${k}="${v}"`)
+              .join(' ')
+            metadata += `        <dc:${key}${optionsStr ? ' ' + optionsStr : ''}>${data.value}</dc:${key}>\n`
+          }
+
+          let manifest = ''
+          let spine = ''
+          let manifestItems = []
+          let spineItems = []
+
+          // Add navigation files
+          manifest += `        <item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>\n`
+          manifest += `        <item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>\n`
+          manifestItems.push('ncx', 'nav')
+
+          // Add cover
+          if (this.coverBuffer) {
+            // this.setInfo('cover', 'cover-image')
+            const mimeType =
+              this.coverExtension === 'png' ? 'image/png' : this.coverExtension === 'gif' ? 'image/gif' : 'image/jpeg'
+            manifest += `        <item id="cover-image" href="Images/cover.${this.coverExtension}" media-type="${mimeType}" properties="cover-image"/>\n`
+            manifest += `        <item id="cover" href="Text/cover.xhtml" media-type="application/xhtml+xml"/>\n`
+            manifestItems.push('cover-image', 'cover')
+            spineItems.push('cover')
+          }
+
+          // Add downloaded images
+          for (const [filename, imageData] of this.images) {
+            let mimeType = 'image/jpeg' // default
+            switch (imageData.extension) {
+              case 'png':
+                mimeType = 'image/png'
+                break
+              case 'gif':
+                mimeType = 'image/gif'
+                break
+              case 'webp':
+                mimeType = 'image/webp'
+                break
+              case 'svg':
+                mimeType = 'image/svg+xml'
+                break
+            }
+            const imageId = `img-${filename.replace(/[^a-zA-Z0-9]/g, '-')}`
+            manifest += `        <item id="${imageId}" href="Images/${filename}" media-type="${mimeType}"/>\n`
+            manifestItems.push(imageId)
+          }
+
+          // Add CSS files
+          for (const [idx, cssData] of this.cssFiles) {
+            manifest += `        <item id="css${idx}" href="Styles/style${idx}.css" media-type="text/css"/>\n`
+            manifestItems.push(`css${idx}`)
+          }
+
+          // Add CSS map files
+          for (const path of this.cssMap.keys()) {
+            const id = `css-map-${path.replace(/[^a-zA-Z0-9]/g, '-')}`
+            manifest += `        <item id="${id}" href="Styles/${path}" media-type="text/css"/>\n`
+            manifestItems.push(id)
+          }
+
+          // Add chapters from volumes
+          const sortedVolumes = Array.from(this.volumes.entries()).sort(([a], [b]) => a - b)
+          for (const [volIdx, volume] of sortedVolumes) {
+            const sortedChapters = Array.from(volume.chapters.entries()).sort(([a], [b]) => a - b)
+            for (const [chapIdx, chapter] of sortedChapters) {
+              const id = `chapter-${volIdx}-${chapIdx}`
+              const href = `Text/chapter_${volIdx}_${chapIdx}.xhtml`
+              manifest += `        <item id="${id}" href="${href}" media-type="application/xhtml+xml"/>\n`
+              manifestItems.push(id)
+              spineItems.push(id)
+            }
+          }
+
+          spine = spineItems.map(id => `        <itemref idref="${id}"/>`).join('\n')
+
+          return `<?xml version="1.0" encoding="UTF-8"?>
+<package version="3.0" xmlns="http://www.idpf.org/2007/opf" unique-identifier="BookId">
+    <metadata xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:opf="http://www.idpf.org/2007/opf">
+${metadata}    </metadata>
+    <manifest>
+${manifest}    </manifest>
+    <spine toc="ncx">
+${spine}
+    </spine>
+</package>`
+        }
+
+        _generateTocNcx() {
+          const title = this.metadata.get('title')?.value || 'Untitled Book'
+          const uuid = this.metadata.get('identifier')?.value || crypto.randomUUID()
+
+          let navPoints = ''
+          let playOrder = 1
+
+          if (this.coverBuffer) {
+            navPoints += `        <navPoint id="cover" playOrder="${playOrder++}">
+            <navLabel><text>Cover</text></navLabel>
+            <content src="Text/cover.xhtml"/>
+        </navPoint>\n`
+          }
+
+          const sortedVolumes = Array.from(this.volumes.entries()).sort(([a], [b]) => a - b)
+          for (const [volIdx, volume] of sortedVolumes) {
+            if (volume.chapters.size > 1) {
+              // Multiple chapters, create volume entry with sub-chapters
+              navPoints += `        <navPoint id="volume-${volIdx}" playOrder="${playOrder++}">
+            <navLabel><text>${volume.title}</text></navLabel>
+            <content src="Text/chapter_${volIdx}_${Array.from(volume.chapters.keys()).sort((a, b) => a - b)[0]}.xhtml"/>
+`
+              const sortedChapters = Array.from(volume.chapters.entries()).sort(([a], [b]) => a - b)
+              for (const [chapIdx, chapter] of sortedChapters) {
+                navPoints += `            <navPoint id="chapter-${volIdx}-${chapIdx}" playOrder="${playOrder++}">
+                <navLabel><text>${chapter.title}</text></navLabel>
+                <content src="Text/chapter_${volIdx}_${chapIdx}.xhtml"/>
+            </navPoint>\n`
+              }
+              navPoints += `        </navPoint>\n`
+            } else {
+              // Single chapter, use volume title
+              const chapIdx = Array.from(volume.chapters.keys())[0]
+              navPoints += `        <navPoint id="volume-${volIdx}" playOrder="${playOrder++}">
+            <navLabel><text>${volume.title}</text></navLabel>
+            <content src="Text/chapter_${volIdx}_${chapIdx}.xhtml"/>
+        </navPoint>\n`
+            }
+          }
+
+          return `<?xml version="1.0" encoding="UTF-8"?>
+<ncx version="2005-1" xmlns="http://www.daisy.org/z3986/2005/ncx/">
+    <head>
+        <meta content="${uuid}" name="dtb:uid"/>
+        <meta content="1" name="dtb:depth"/>
+        <meta content="0" name="dtb:totalPageCount"/>
+        <meta content="0" name="dtb:maxPageNumber"/>
+    </head>
+    <docTitle>
+        <text>${title}</text>
+    </docTitle>
+    <navMap>
+${navPoints}    </navMap>
+</ncx>`
+        }
+
+        _generateNavXhtml() {
+          const title = this.metadata.get('title')?.value || 'Untitled Book'
+
+          let navItems = ''
+
+          if (this.coverBuffer) {
+            navItems += `            <li><a href="Text/cover.xhtml">Cover</a></li>\n`
+          }
+
+          const sortedVolumes = Array.from(this.volumes.entries()).sort(([a], [b]) => a - b)
+          for (const [volIdx, volume] of sortedVolumes) {
+            if (volume.chapters.size > 1) {
+              navItems += `            <li>\n                <a href="Text/chapter_${volIdx}_${
+                Array.from(volume.chapters.keys()).sort((a, b) => a - b)[0]
+              }.xhtml">${volume.title}</a>\n                <ol>\n`
+              const sortedChapters = Array.from(volume.chapters.entries()).sort(([a], [b]) => a - b)
+              for (const [chapIdx, chapter] of sortedChapters) {
+                navItems += `                    <li><a href="Text/chapter_${volIdx}_${chapIdx}.xhtml">${chapter.title}</a></li>\n`
+              }
+              navItems += `                </ol>\n            </li>\n`
+            } else {
+              const chapIdx = Array.from(volume.chapters.keys())[0]
+              navItems += `            <li><a href="Text/chapter_${volIdx}_${chapIdx}.xhtml">${volume.title}</a></li>\n`
+            }
+          }
+
+          return `<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
+    <head>
+        <title>${title} - Table of Contents</title>
+        <meta name="viewport" content="width=device-width, height=device-height, initial-scale=1.0"/>
+    </head>
+    <body>
+        <nav epub:type="toc" id="toc">
+            <h1>Table of Contents</h1>
+            <ol>
+${navItems}            </ol>
+        </nav>
+    </body>
+</html>`
+        }
+
+        _generateCoverXhtml() {
+          if (!this.coverBuffer) return ''
+
+          const title = this.metadata.get('title')?.value || 'Untitled Book'
+
+          return `<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+    <head>
+        <title>${title} - Cover</title>
+        <meta name="viewport" content="width=device-width, height=device-height, initial-scale=1.0"/>
+        <style type="text/css">
+            body { margin: 0; padding: 0; text-align: center; }
+            .cover { width: 100%; height: 100vh; object-fit: contain; }
+        </style>
+    </head>
+    <body>
+        <img src="../Images/cover.${this.coverExtension}" alt="Cover" class="cover"/>
+    </body>
+</html>`
+        }
+
+        _formatXML(xmlString) {
+          // Simple XML formatter to add proper indentation
+          let formatted = ''
+          let indent = ''
+          const indentStep = '    ' // 4 spaces
+
+          // Split by tags
+          const tokens = xmlString.split(/(<[^>]*>)/)
+
+          for (let i = 0; i < tokens.length; i++) {
+            const token = tokens[i].trim()
+            if (!token) continue
+
+            if (token.startsWith('</')) {
+              // Closing tag - decrease indent
+              indent = indent.substring(indentStep.length)
+              formatted += indent + token + '\n'
+            } else if (token.startsWith('<')) {
+              if (token.endsWith('/>') || token.includes('<?xml') || token.includes('<!DOCTYPE')) {
+                // Self-closing tag, XML declaration, or DOCTYPE - same indent
+                formatted += indent + token + '\n'
+              } else {
+                // Opening tag - add at current indent, then increase
+                formatted += indent + token + '\n'
+                // Check if this is not immediately followed by a closing tag
+                const nextToken = i + 1 < tokens.length ? tokens[i + 1].trim() : ''
+                if (!nextToken.startsWith('</')) {
+                  indent += indentStep
+                }
+              }
+            } else {
+              // Text content
+              if (token.length > 0) {
+                formatted += indent + token + '\n'
+              }
+            }
+          }
+
+          return formatted.trim()
+        }
+
+        _generateChapterXhtml(chapter, volIdx, chapIdx) {
+          if (chapter.type === 'html' || chapter.type === 'xhtml') {
+            // Content is already complete HTML/XHTML, use browser APIs to format properly
+            try {
+              const parser = new DOMParser()
+              const doc = parser.parseFromString(chapter.content, 'application/xhtml+xml')
+
+              // Check for parsing errors
+              const parserError = doc.querySelector('parsererror')
+              if (parserError) {
+                // Try parsing as HTML instead
+                const htmlDoc = parser.parseFromString(chapter.content, 'text/html')
+
+                // Ensure head element exists
+                let head = htmlDoc.querySelector('head')
+                if (!head) {
+                  head = htmlDoc.createElement('head')
+                  htmlDoc.documentElement.insertBefore(head, htmlDoc.body)
+                }
+
+                // Add title if missing
+                let titleElement = head.querySelector('title')
+                if (!titleElement) {
+                  titleElement = htmlDoc.createElement('title')
+                  titleElement.textContent = chapter.title
+                  head.insertBefore(titleElement, head.firstChild)
+                }
+
+                // Add viewport meta if missing
+                let viewportMeta = head.querySelector('meta[name="viewport"]')
+                if (!viewportMeta) {
+                  viewportMeta = htmlDoc.createElement('meta')
+                  viewportMeta.setAttribute('name', 'viewport')
+                  viewportMeta.setAttribute('content', 'width=device-width, height=device-height, initial-scale=1.0')
+                  head.appendChild(viewportMeta)
+                }
+
+                // Add visible title in body if no heading exists
+                const body = htmlDoc.querySelector('body')
+                if (body) {
+                  const existingHeading = body.querySelector('h1, h2, h3, h4, h5, h6')
+                  if (!existingHeading) {
+                    const chapterHeading = htmlDoc.createElement('h2')
+                    chapterHeading.textContent = chapter.title
+                    body.insertBefore(chapterHeading, body.firstChild)
+                  }
+                }
+
+                // Convert to XHTML format
+                const serializer = new XMLSerializer()
+                let result = serializer.serializeToString(htmlDoc.documentElement)
+
+                // Add XML declaration if missing
+                if (!result.startsWith('<?xml')) {
+                  result = '<?xml version="1.0" encoding="UTF-8"?>\n' + result
+                }
+
+                // Ensure XHTML namespace
+                if (!result.includes('xmlns="http://www.w3.org/1999/xhtml"')) {
+                  result = result.replace('<html', '<html xmlns="http://www.w3.org/1999/xhtml"')
+                }
+
+                return this._formatXML(result)
+              } else {
+                // Valid XHTML, ensure head element exists
+                let head = doc.querySelector('head')
+                if (!head) {
+                  head = doc.createElement('head')
+                  doc.documentElement.insertBefore(head, doc.body)
+                }
+
+                // Add title if missing
+                let titleElement = head.querySelector('title')
+                if (!titleElement) {
+                  titleElement = doc.createElement('title')
+                  titleElement.textContent = chapter.title
+                  head.insertBefore(titleElement, head.firstChild)
+                }
+
+                // Add viewport meta if missing
+                let viewportMeta = head.querySelector('meta[name="viewport"]')
+                if (!viewportMeta) {
+                  viewportMeta = doc.createElement('meta')
+                  viewportMeta.setAttribute('name', 'viewport')
+                  viewportMeta.setAttribute('content', 'width=device-width, height=device-height, initial-scale=1.0')
+                  head.appendChild(viewportMeta)
+                }
+
+                // Add visible title in body if no heading exists
+                const body = doc.querySelector('body')
+                if (body) {
+                  const existingHeading = body.querySelector('h1, h2, h3, h4, h5, h6')
+                  if (!existingHeading) {
+                    const chapterHeading = doc.createElement('h2')
+                    chapterHeading.textContent = chapter.title
+                    body.insertBefore(chapterHeading, body.firstChild)
+                  }
+                }
+
+                // Serialize back to clean XHTML
+                const serializer = new XMLSerializer()
+                let result = serializer.serializeToString(doc)
+
+                // Add XML declaration if missing
+                if (!result.startsWith('<?xml')) {
+                  result = '<?xml version="1.0" encoding="UTF-8"?>\n' + result
+                }
+
+                return this._formatXML(result)
+              }
+            } catch (error) {
+              // Fallback to original content if parsing fails
+              console.warn('Failed to parse XHTML content:', error)
+              return chapter.content
+            }
+          } else {
+            // Content type is "text", wrap in basic XHTML structure
+            const globalCSS = this.cssFiles.get(0)
+            let cssLinks = ''
+
+            if (chapter.useGlobalCSS && globalCSS) {
+              cssLinks += `        <link rel="stylesheet" type="text/css" href="../Styles/style0.css"/>\n`
+            }
+
+            let bodyContent = chapter.content
+
+            // For text type, wrap in paragraph tags and convert newlines
+            bodyContent = `        <p>${bodyContent.replace(/\n\n/g, '</p>\n        <p>').replace(/\n/g, '<br/>')}</p>`
+
+            return `<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+    <head>
+        <title>${chapter.title}</title>
+        <meta name="viewport" content="width=device-width, height=device-height, initial-scale=1.0"/>
+${cssLinks}    </head>
+    <body>
+        <h1>${chapter.title}</h1>
+${bodyContent}
+    </body>
+</html>`
           }
         }
 
         async save() {
-          const zip = new JSZip()
+          // Add mimetype file first (MUST be uncompressed and first in ZIP)
+          this.zip.file('mimetype', 'application/epub+zip', { compression: 'STORE' })
 
-          // Add mimetype
-          zip.file('mimetype', 'application/epub+zip', { compression: 'STORE' })
+          // Create directory structure
+          this.zip.folder('META-INF')
+          this.zip.folder('OEBPS')
+          this.zip.folder('OEBPS/Text')
+          this.zip.folder('OEBPS/Styles')
+          this.zip.folder('OEBPS/Images')
 
-          // Create container
-          const container = `<?xml version="1.0"?>
-<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
-  <rootfiles>
-    <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
-  </rootfiles>
-</container>`
-          zip.folder('META-INF').file('container.xml', container)
+          // Compression options for all other files (except mimetype)
+          const compressionOptions = { compression: 'DEFLATE', compressionOptions: { level: 6 } }
 
-          // Generate OPF
-          const opf = this.generateOPF()
-          zip.folder('OEBPS').file('content.opf', opf)
-          const ncxContent = this.generateNCX()
-          zip.folder('OEBPS').file('toc.ncx', ncxContent)
+          // Add META-INF/container.xml
+          this.zip.file('META-INF/container.xml', this._generateContainer(), compressionOptions)
 
-          // Add all resources
-          this.resources.forEach((content, path) => {
-            zip.folder('OEBPS').file(path, content)
-          })
+          // Add OEBPS files
+          this.zip.file('OEBPS/content.opf', this._generateContentOpf(), compressionOptions)
+          this.zip.file('OEBPS/toc.ncx', this._generateTocNcx(), compressionOptions)
+          this.zip.file('OEBPS/nav.xhtml', this._generateNavXhtml(), compressionOptions)
 
-          // Generate nav
-          const nav = this.generateNav()
-          zip.folder('OEBPS').file('nav.xhtml', nav)
-
-          return zip.generateAsync({ type: 'uint8array', compression: 'DEFLATE' })
-        }
-
-        generateNCX() {
-          let playOrder = 1
-          const navPoints = []
-
-          this.volumes
-            .sort((a, b) => a.idx - b.idx)
-            .forEach(vol => {
-              // 为每个卷创建容器navPoint（不设置具体内容）
-              const volumePoint = `
-      <navPoint id="navpoint-${playOrder}" playOrder="${playOrder++}">
-        <navLabel><text>${vol.title}</text></navLabel>
-        <content src="${vol.containerFile || vol.chapters[0]?.filename}"/>`
-
-              // 创建章节navPoint
-              const chapterPoints = vol.chapters
-                .sort((a, b) => a.idx - b.idx)
-                .map(
-                  chap => `
-          <navPoint id="navpoint-${playOrder}" playOrder="${playOrder++}">
-            <navLabel><text>${chap.title}</text></navLabel>
-            <content src="${chap.filename}"/>
-          </navPoint>`
-                )
-                .join('')
-
-              navPoints.push(`${volumePoint}${chapterPoints}</navPoint>`)
-            })
-
-          return `<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE ncx PUBLIC "-//NISO//DTD ncx 2005-1//EN" "http://www.daisy.org/z3986/2005/ncx-2005-1.dtd">
-<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">
-  <head>
-    <meta name="dtb:uid" content="urn:uuid:${this.uuid}"/>
-    <meta name="dtb:depth" content="2"/>
-    <meta name="dtb:totalPageCount" content="0"/>
-    <meta name="dtb:maxPageNumber" content="0"/>
-  </head>
-  <docTitle>
-    <text>${this.info.bookname || 'Untitled'}</text>
-  </docTitle>
-  <navMap>
-    ${navPoints.join('')}
-  </navMap>
-</ncx>`
-        }
-
-        generateOPF() {
-          const metadata = [
-            `<dc:identifier id="BookId">urn:uuid:${this.uuid}</dc:identifier>`,
-            `<dc:title>${this.info.bookname || 'Untitled'}</dc:title>`,
-            `<dc:creator>${this.info.author || 'Unknown'}</dc:creator>`,
-            `<dc:description>${this.info.introduction || ''}</dc:description>`,
-            `<dc:language>zh-CN</dc:language>`,
-            `<meta property="dcterms:modified">${moment(Date.now()).utc().format('YYYY-MM-DDTHH:mm:ss')}Z</meta>`,
-          ]
-
-          // 增强封面处理
-          if (this.info.cover) {
-            metadata.push(`<meta name="cover" content="cover-image"/>`, `<meta property="rendition:layout">pre-paginated</meta>`)
-            this._addResource('images/cover.jpg', this.info.cover)
-
-            // 添加封面XHTML页面
-            const coverHtml = `<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE html>
-<html xmlns="http://www.w3.org/1999/xhtml">
-<head>
-  <meta name="viewport" content="width=device-width, height=device-height, initial-scale=1.0, minimum-scale=1.0"/>
-  <title>Cover</title>
-</head>
-<body>
-  <div style="text-align: center; padding: 0pt; margin: 0pt;">
-    <img src="images/cover.jpg" alt="Cover Image" style="height: 100%; max-width: 100%;"/>
-  </div>
-</body>
-</html>`
-            this._addResource('cover.xhtml', new TextEncoder().encode(coverHtml))
+          // Add cover image and page
+          if (this.coverBuffer) {
+            this.zip.file(`OEBPS/Images/cover.${this.coverExtension}`, this.coverBuffer, compressionOptions)
+            this.zip.file('OEBPS/Text/cover.xhtml', this._generateCoverXhtml(), compressionOptions)
           }
 
-          const manifest = [
-            '<item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>',
-            '<item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>',
-          ]
-
-          if (this.info.cover) {
-            manifest.push(
-              '<item id="cover-image" href="images/cover.jpg" media-type="image/jpeg" properties="cover-image"/>',
-              '<item id="cover" href="cover.xhtml" media-type="application/xhtml+xml"/>'
-            )
+          // Add downloaded images
+          for (const [filename, imageData] of this.images) {
+            this.zip.file(`OEBPS/Images/${filename}`, imageData.buffer, compressionOptions)
           }
 
-          this.resources.forEach((_, path) => {
-            const id = path.replace(/[^a-z0-9]/gi, '-')
-            let type = 'application/octet-stream'
-            if (path.endsWith('.xhtml')) type = 'application/xhtml+xml'
-            else if (path.endsWith('.css')) type = 'text/css'
-            else if (path.match(/\.jpe?g$/)) type = 'image/jpeg'
-            else if (path.endsWith('.png')) type = 'image/png'
-            manifest.push(`<item id="${id}" href="${path}" media-type="${type}"/>`)
-          })
-
-          const spine = []
-          if (this.info.cover) {
-            spine.push('<itemref idref="cover"/>')
+          // Add CSS files
+          for (const [idx, cssData] of this.cssFiles) {
+            this.zip.file(`OEBPS/Styles/style${idx}.css`, cssData.content, compressionOptions)
           }
-          this.volumes
-            .sort((a, b) => a.idx - b.idx)
-            .forEach(v => {
-              v.chapters
-                .sort((a, b) => a.idx - b.idx)
-                .forEach(c => {
-                  spine.push(`<itemref idref="${c.filename.replace(/[^a-z0-9]/gi, '-')}"/>`)
-                })
-            })
 
-          const guide = this.info.cover ? `<reference href="cover.xhtml" type="cover" title="Cover"/>` : ''
+          // Add CSS map files
+          for (const [path, content] of this.cssMap) {
+            this.zip.file(`OEBPS/Styles/${path}`, content, compressionOptions)
+          }
 
-          return `<?xml version="1.0" encoding="UTF-8"?>
-<package xmlns="http://www.idpf.org/2007/opf" unique-identifier="BookId" version="3.0">
-  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
-    ${metadata.join('\n    ')}
-  </metadata>
-  <manifest>
-    ${manifest.join('\n    ')}
-  </manifest>
-  <spine toc="ncx">
-    ${spine.join('\n    ')}
-  </spine>
-  <guide>
-    ${guide}
-  </guide>
-</package>`
-        }
+          // Add chapters
+          const sortedVolumes = Array.from(this.volumes.entries()).sort(([a], [b]) => a - b)
+          for (const [volIdx, volume] of sortedVolumes) {
+            const sortedChapters = Array.from(volume.chapters.entries()).sort(([a], [b]) => a - b)
+            for (const [chapIdx, chapter] of sortedChapters) {
+              const filename = `OEBPS/Text/chapter_${volIdx}_${chapIdx}.xhtml`
+              const content = this._generateChapterXhtml(chapter, volIdx, chapIdx)
+              this.zip.file(filename, content, compressionOptions)
+            }
+          }
 
-        generateNav() {
-          const items = this.volumes
-            .sort((a, b) => a.idx - b.idx)
-            .map(
-              v => `
-      <li>
-        <a href="${v.chapters[0]?.filename || ''}">${v.title}</a>
-        <ol>
-          ${v.chapters
-            .sort((a, b) => a.idx - b.idx)
-            .map(
-              c => `
-            <li><a href="${c.filename}">${c.title}</a></li>
-          `
-            )
-            .join('')}
-        </ol>
-      </li>
-    `
-            )
-            .join('')
-
-          return `<?xml version="1.0" encoding="UTF-8"?>
-<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
-<head>
-  <title>Table of Contents</title>
-</head>
-<body>
-  <nav epub:type="toc">
-    <h1>Table of Contents</h1>
-    <ol>
-      ${items}
-    </ol>
-  </nav>
-</body>
-</html>`
+          // Generate and return the EPUB buffer
+          return await this.zip.generateAsync({ type: 'arraybuffer' })
         }
       }
 
-      class Volume {
-        constructor(epub, title, idx) {
-          this.epub = epub
-          this.title = title
+      class EpubVolume {
+        constructor(idx, title, saver) {
           this.idx = idx
-          this.chapters = []
-          this.containerFile = `volume_${idx}.xhtml`
-          const content = `<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE html>
-<html xmlns="http://www.w3.org/1999/xhtml">
-  <head>
-    <title>${title}</title>
-  </head>
-  <body>
-    <h1>${title}</h1>
-  </body>
-</html>`
-          this.epub._addResource(this.containerFile, new TextEncoder().encode(content))
-          // MIME 类型到扩展名映射
-          this.mimeMap = new Map([
-            ['image/jpeg', 'jpg'],
-            ['image/png', 'png'],
-            ['image/gif', 'gif'],
-            ['image/webp', 'webp'],
-            ['image/svg+xml', 'svg'],
-            ['image/avif', 'avif'],
-            ['application/octet-stream', 'bin'],
-          ])
+          this.title = title
+          this.saver = saver
+          this.chapters = new Map()
         }
 
-        async addChapter(idx, content, title, contentType, insertTitle = true, useGlobalCSS = true, cssList = []) {
-          let chapD = this._extractContent(content)
-          // console.log('nohtmlTag', chapD)
-          // 内容预处理
-          let processed = this._wrapContent(chapD, title, contentType, insertTitle)
-          // console.log(processed)
-
-          // 图片处理
-          const { content: finalContent, resources } = await this.processImages(processed)
-
-          // 资源注册
-          this._registerResources(resources)
-
-          // 构建 XHTML
-          // console.log(this._extractContent(finalContent));
-          const xhtml = this._buildXHTML(this._wrapContent(finalContent), title, useGlobalCSS, cssList)
-          const filename = `chapter_${this.idx}_${idx}.xhtml`
-
-          this.epub._addResource(filename, new TextEncoder().encode(xhtml))
-          this.chapters.push({ idx, title, filename })
-
-          return idx
-        }
-
-        async processImages(content) {
-          const parser = new DOMParser()
-          const doc = parser.parseFromString(content, 'text/html')
-          const images = doc.querySelectorAll('img')
-          const resources = []
-
-          await Promise.all(
-            Array.from(images).map(async img => {
-              let url = img.getAttribute('src')
-              if (!url || this.epub.resourceUrls.has(url)) return
-
-              try {
-                if (!url.startsWith('http')) {
-                  throw new Error('img src is not an url')
-                }
-                console.log('fetch chapter.image', url)
-                if (url.startsWith('http://') && window.location.href.startsWith('https://')) {
-                  console.warn(
-                    'DeprecationWarning:',
-                    'Mixed content warning: image is transported by unsafe protocol "http"',
-                    'try upgrade to https'
-                  )
-                  url = url.replace('http://', 'https://')
-                }
-                const response = await fetch(url)
-
-                if (!response.ok) throw new Error(`HTTP ${response.status}`)
-
-                // 类型识别
-                const contentType = response.headers.get('Content-Type') || 'application/octet-stream'
-                const [mimeType] = contentType.split(';')
-                const ext = this._getExtension(mimeType, url)
-
-                // 二进制处理
-                const arrayBuffer = await response.arrayBuffer()
-                const filename = `images/img${this.epub.resourceCounters.image++}.${ext}`
-
-                img.setAttribute('src', filename)
-                resources.push([url, filename, new Uint8Array(arrayBuffer)])
-              } catch (e) {
-                console.warn(`Image processing failed: ${url}`, e)
-                img.remove() // 自动移除无效图片
-              }
-            })
-          )
-
-          // 序列化处理
-          const serializer = new XMLSerializer()
-          let processed = serializer.serializeToString(doc.documentElement).replace(/^<div>|<\/div>$/g, '') // 移除包装 div
-
-          return { content: processed, resources }
-        }
-
-        // 私有辅助方法
-        _wrapContent(content, title, contentType, insertTitle) {
-          if (contentType === 'text') {
-            return `<pre>${insertTitle ? `<h1>${title}</h1>` : ''}${content}</pre>`
+        async addChapter(idx, title, content, type = 'text', useGlobalCSS = false) {
+          // Process CSS links and download images from HTML/XHTML content
+          let processedContent = content
+          if (type === 'html' || type === 'xhtml') {
+            processedContent = await this.saver._processCSSLinksInContent(content)
+            processedContent = await this.saver._downloadImagesFromContent(processedContent)
           }
-          if (contentType === 'html' && insertTitle) {
-            return `<h1>${title}</h1>${content}`
-          }
-          return content
-        }
 
-        _registerResources(resources) {
-          resources.forEach(([url, path, data]) => {
-            this.epub.resourceUrls.set(url, path)
-            this.epub._addResource(path, data)
+          this.chapters.set(idx, {
+            title,
+            content: processedContent,
+            type,
+            useGlobalCSS,
           })
-        }
-
-        _buildXHTML(content1, title, useGlobalCSS, cssList) {
-          const cssLinks = []
-
-          if (useGlobalCSS) {
-            const globalCSS = this.epub.cssList.find(c => c.idx === 0)
-            if (globalCSS) cssLinks.push(globalCSS)
-          }
-
-          cssList.forEach(idx => {
-            console.log('find css idx', idx)
-            const css = this.epub.cssList.find(c => c.idx === idx)
-            if (css) cssLinks.push(css)
-          })
-          // console.log(content1)
-          return `<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE html>
-<html xmlns="http://www.w3.org/1999/xhtml">
-<head>
-  <meta name="viewport" content="width=device-width, height=device-height, initial-scale=1.0"/>
-  <title>${this._escapeXML(title)}</title>
-  ${cssLinks.map(c => `<link href="${c.filename}" rel="stylesheet"/>`).join('\n  ')}
-</head>
-<body>
-  ${this._extractContent(content1)}
-</body>
-</html>`
-        }
-
-        _getExtension(mimeType, url) {
-          // 优先使用 MIME 类型
-          const fromMime = this.mimeMap.get(mimeType) || mimeType.split('/').pop()
-
-          // 后备使用 URL 后缀
-          const fromUrl = url.split(/[#?]/)[0].split('.').pop()
-
-          return (fromMime || fromUrl || 'bin').toLowerCase()
-        }
-
-        _escapeXML(str) {
-          return str.replace(
-            /[<>&'"]/g,
-            c =>
-              ({
-                '<': '&lt;',
-                '>': '&gt;',
-                '&': '&amp;',
-                "'": '&apos;',
-                '"': '&quot;',
-              }[c])
-          )
-        }
-
-        _extractContent(html) {
-          try {
-            const articleMatch = html.match(/<article>([\s\S]*?)<\/article>/i)
-            if (articleMatch) return articleMatch[1]
-
-            const bodyMatch = html.match(/<body>([\s\S]*?)<\/body>/i)
-            if (bodyMatch) return bodyMatch[1]
-
-            return html
-          } catch (e) {
-            console.warn('内容解析失败，使用原始内容', e)
-            return html
-          }
         }
       }
 
@@ -608,8 +877,17 @@
         </select>
         <input type="text" id="book-search" placeholder="请输入小说名称" />
         <button type="button" onclick="searchBooks()">
-          <svg xmlns="http://www.w3.org/2000/svg" fill="currentColor" width="24" height="24" viewBox="0 0 24 24" display="inherit">
-            <path d="M16.296 16.996a8 8 0 11.707-.708l3.909 3.91-.707.707-3.909-3.909zM18 11a7 7 0 00-14 0 7 7 0 1014 0z" />
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            fill="currentColor"
+            width="24"
+            height="24"
+            viewBox="0 0 24 24"
+            display="inherit"
+          >
+            <path
+              d="M16.296 16.996a8 8 0 11.707-.708l3.909 3.91-.707.707-3.909-3.909zM18 11a7 7 0 00-14 0 7 7 0 1014 0z"
+            />
           </svg>
         </button>
       </form>
@@ -659,11 +937,12 @@
           </div>
           <p id="sub-progress-title" class="progress-text">副标题</p>
         </div>
-        </p>
         <button id="progress-cancel" class="progress-cancel">取消</button>
         <button id="progress-submit" class="progress-submit" style="display: none">确定</button>
         <button id="button-resave" class="button-resave" style="display: none" onclick="reSave()">手动保存</button>
-        <button id="button-redownload" class="button-redownload" style="display: none" onclick="reDownload()">重新下载</button>
+        <button id="button-redownload" class="button-redownload" style="display: none" onclick="reDownload()">
+          重新下载
+        </button>
       </div>
     </div>
     <!-- 点击书名后的弹窗 -->
@@ -672,10 +951,12 @@
         <span>内容</span>
       </div>
     </dialog>
-    <hr>
+    <hr />
     <div class="footer">
       <div class="about-container">
-        <p class="about-text">本网页为 <a href="https://github.com/MeoProject/PyFQWeb">PyFQWeb</a> 项目的一部分，请遵守开源协议使用</p>
+        <p class="about-text">
+          本网页为 <a href="https://github.com/MeoProject/PyFQWeb">PyFQWeb</a> 项目的一部分，请遵守开源协议使用
+        </p>
       </div>
     </div>
     <script>
@@ -683,7 +964,16 @@
       if (!apiNode) alert('请配置apiNode后再使用网页（需要支持跨域）')
 
       function sleep(ms) {
-        return new Promise(resolve => setTimeout(resolve, ms));
+        return new Promise(resolve => setTimeout(resolve, ms))
+      }
+
+      function btoaEh(str) {
+        const bytes = new TextEncoder().encode(str)
+
+        let binary = ''
+        bytes.forEach(b => (binary += String.fromCharCode(b)))
+
+        return btoa(binary)
       }
 
       // 设置页面主题
@@ -722,55 +1012,81 @@
 
       function formatCount(num, lang) {
         const units = {
-          'zh': [{d: 1e8, s: '亿'}, {d: 1e4, s: '万'}],
-          'en': [{d: 1e9, s: 'billion'}, {d: 1e6, s: 'million'}, {d: 1e3, s: 'thousand'}],
-          'ja': [{d: 1e8, s: '億'}, {d: 1e4, s: '万'}],
-          'ko': [{d: 1e8, s: '억'}, {d: 1e4, s: '만'}],
-          'de': [{d: 1e9, s: 'Milliarde'}, {d: 1e6, s: 'Million'}, {d: 1e3, s: 'Tausend'}],
-          'es': [{d: 1e9, s: 'mil millones'}, {d: 1e6, s: 'millón'}, {d: 1e3, s: 'mil'}],
-          'ru': [{d: 1e9, s: 'миллиард'}, {d: 1e6, s: 'миллион'}, {d: 1e3, s: 'тысяча'}],
-          'ar': [{d: 1e9, s: 'مليار'}, {d: 1e6, s: 'مليون'}, {d: 1e3, s: 'ألف'}]
-        };
+          zh: [
+            { d: 1e8, s: '亿' },
+            { d: 1e4, s: '万' },
+          ],
+          en: [
+            { d: 1e9, s: 'billion' },
+            { d: 1e6, s: 'million' },
+            { d: 1e3, s: 'thousand' },
+          ],
+          ja: [
+            { d: 1e8, s: '億' },
+            { d: 1e4, s: '万' },
+          ],
+          ko: [
+            { d: 1e8, s: '억' },
+            { d: 1e4, s: '만' },
+          ],
+          de: [
+            { d: 1e9, s: 'Milliarde' },
+            { d: 1e6, s: 'Million' },
+            { d: 1e3, s: 'Tausend' },
+          ],
+          es: [
+            { d: 1e9, s: 'mil millones' },
+            { d: 1e6, s: 'millón' },
+            { d: 1e3, s: 'mil' },
+          ],
+          ru: [
+            { d: 1e9, s: 'миллиард' },
+            { d: 1e6, s: 'миллион' },
+            { d: 1e3, s: 'тысяча' },
+          ],
+          ar: [
+            { d: 1e9, s: 'مليار' },
+            { d: 1e6, s: 'مليون' },
+            { d: 1e3, s: 'ألف' },
+          ],
+        }
 
-        const browserLang = (navigator.language || 'en').substring(0,2);
-        const targetLang = units[lang] ? lang : units[browserLang] ? browserLang : 'en';
+        const browserLang = (navigator.language || 'en').substring(0, 2)
+        const targetLang = units[lang] ? lang : units[browserLang] ? browserLang : 'en'
 
-        const unit = units[targetLang].find(u => num >= u.d) || {d:1, s:''};
-        const value = num / unit.d;
+        const unit = units[targetLang].find(u => num >= u.d) || { d: 1, s: '' }
+        const value = num / unit.d
 
-        const formatted = value.toLocaleString(targetLang, {
-          maximumFractionDigits: 3,
-          minimumFractionDigits: 0
-        }).replace(/\.0+$/, '');
+        const formatted = value
+          .toLocaleString(targetLang, {
+            maximumFractionDigits: 3,
+            minimumFractionDigits: 0,
+          })
+          .replace(/\.0+$/, '')
 
-        return targetLang === 'ar' 
-          ? `${formatted}\u202C${unit.s}\u202C` 
-          : `${formatted}${unit.s}`;
+        return targetLang === 'ar' ? `${formatted}\u202C${unit.s}\u202C` : `${formatted}${unit.s}`
       }
-      
+
       function formatDuration(seconds) {
         // 处理负数边界情况
-        const totalSeconds = Math.max(0, Math.round(seconds));
-    
+        const totalSeconds = Math.max(0, Math.round(seconds))
+
         // 时间单位分解
-        const hours = Math.floor(totalSeconds / 3600);
-        const remaining = totalSeconds % 3600;
-        const minutes = Math.floor(remaining / 60);
-        const secs = remaining % 60;
+        const hours = Math.floor(totalSeconds / 3600)
+        const remaining = totalSeconds % 3600
+        const minutes = Math.floor(remaining / 60)
+        const secs = remaining % 60
 
         // 构建时间片段
-        const timeFragments = [];
+        const timeFragments = []
         if (hours > 0) {
-          timeFragments.push(
-            hours.toString().padStart(2, '0'),
-            minutes.toString().padStart(2, '0')
-          );
+          timeFragments.push(hours.toString().padStart(2, '0'), minutes.toString().padStart(2, '0'))
         } else {
-          timeFragments.push(minutes.toString().padStart(2, '0'));
+          timeFragments.push(minutes.toString().padStart(2, '0'))
         }
-        timeFragments.push(secs.toString().padStart(2, '0'));
+        timeFragments.push(secs.toString().padStart(2, '0'))
 
-        return timeFragments.join(':');
+        return timeFragments.join(':')
       }
 
       function isShitBrowser() {
@@ -859,9 +1175,9 @@
       // 显示书籍详细信息
       async function showBookInfo(bookId) {
         const platformMap = {
-          '1967': '番茄APP',
-          '1128': '抖音',
-          '13': '今日头条'
+          1967: '番茄APP',
+          1128: '抖音',
+          13: '今日头条',
         }
         // console.log('saveAs', saveAs)
         const bookList = document.getElementById('book-list')
@@ -887,32 +1203,63 @@
             (bookData.creation_status << 0) + 1
           ]
           document.getElementById('latest-chapter').textContent = bookData.last_chapter_title || '未知'
-          document.getElementById('latest-chapter-passtime').textContent = timeStampFormat(bookData.last_chapter_first_pass_time)
+          document.getElementById('latest-chapter-passtime').textContent = timeStampFormat(
+            bookData.last_chapter_first_pass_time
+          )
           document.getElementById('internal-alert-container').innerHTML = `
 <h3 align="center">基础信息</h3>
-<p>书籍ID: ${bookData.book_id}  <a href="https://fanqienovel.com/page/${bookData.book_id}" target="_blank">去官方</a> <a href="legado://import/addToBookshelf?src=https%3A%2F%2Ffanqienovel.com%2F${bookData.book_id}">在开源阅读查看</a> <a href="dragon1967://reading?bookId=${bookData.book_id}">在番茄小说查看</a></p>
+<p>书籍ID: ${bookData.book_id}  <a href="https://fanqienovel.com/page/${
+            bookData.book_id
+          }" target="_blank">去官方</a> <a href="legado://import/addToBookshelf?src=https%3A%2F%2Ffanqienovel.com%2F${
+            bookData.book_id
+          }">在开源阅读查看</a> <a href="dragon1967://reading?bookId=${bookData.book_id}">在番茄小说查看</a></p>
 <p>当前报告返回书名: ${bookData.book_name}</p>
-<p>书籍源名（作者开书使用的名字）: ${bookData.original_book_name} <a href="https://p6-novel.byteimg.com/origin/${bookData.thumb_uri}" target="_blank">查看封面</a></p>
-<p>书籍别名（书籍宣发使用的名字）: ${bookData.book_flight_alias_name || '无'} ${bookData.book_flight_alias_name ? '<a href="https://p6-novel.byteimg.com/origin/' + bookData.book_flight_alias_thumb + '" target="_blank">查看封面</a>' : ''}</p>
+<p>书籍源名（作者开书使用的名字）: ${bookData.original_book_name} <a href="https://p6-novel.byteimg.com/origin/${
+            bookData.thumb_uri
+          }" target="_blank">查看封面</a></p>
+<p>书籍别名（书籍宣发使用的名字）: ${bookData.book_flight_alias_name || '无'} ${
+            bookData.book_flight_alias_name
+              ? '<a href="https://p6-novel.byteimg.com/origin/' +
+                bookData.book_flight_alias_thumb +
+                '" target="_blank">查看封面</a>'
+              : ''
+          }</p>
 <p>短书名: ${bookData.book_short_name || '无'}</p>
+<p>字数: ${formatCount(bookData.word_number)} (${bookData.word_number})</p>
 <p>书籍创建时间: ${moment(bookData.create_time).format('YYYY-MM-DD HH:mm:ss')} (${bookData.create_time})</p>
 <p>分类: ${bookData.category}</p>
 <p>标签: ${bookData.tags}</p>
 <p>读者数: ${formatCount(bookData.read_count)} (${bookData.read_count})</p>
 <p>听书人数: ${formatCount(bookData.listen_count)} (${bookData.listen_count})</p>
-<p>书籍分类: ${bookData.gender ? (['女频', '男频', '出版'][(bookData.gender << 0)] || '未知') : '未知'} (${bookData.gender})</p>
-<p>当前状态: ${['未知', '完结', '连载', null, null, null, '断更'][(bookData.creation_status << 0) + 1] || '未知'} (${bookData.creation_status})</p>
+<p>书籍分类: ${bookData.gender ? ['女频', '男频', '出版'][bookData.gender << 0] || '未知' : '未知'} (${
+            bookData.gender
+          })</p>
+<p>当前状态: ${['未知', '完结', '连载', null, null, null, '断更'][(bookData.creation_status << 0) + 1] || '未知'} (${
+            bookData.creation_status
+          })</p>
 <p>ISBN: ${bookData.isbn || '书籍无出版数据'}</p>
 <p>${bookData.copyright_info.replace('，如有任何疑问，请通过“我的-意见反馈”告知我们', '')}。</p>
 <hr>
 <h3 align="center">简介</h3>
-<p>${('\u3000\u3000' + bookData.book_abstract_v2.split('\n').join('<br />\u3000\u3000')).replace(/[\u3000]+/g, '\u3000\u3000')}</p>
+<p>${('\u3000\u3000' + bookData.book_abstract_v2.split('\n').join('<br />\u3000\u3000')).replace(
+            /[\u3000]+/g,
+            '\u3000\u3000'
+          )}</p>
 <hr>
 <h3 align="center">数据信息</h3>
 <p>听书总时长: ${formatDuration(bookData.duration)} (${bookData.duration}s)</p>
 <p align="center"><strong>以下数据仅供参考</strong></p>
-<p>活跃读者数: ${formatCount(bookData.read_count)} (${bookData.read_count}) | 总读者数: ${formatCount(bookData.read_count_all)} (${bookData.read_count_all}) | 占比: ${(bookData.read_count / bookData.read_count_all * 100).toFixed(3)}%</p>
-<p>总加书架数: ${formatCount(bookData.shelf_cnt_history)} (${bookData.shelf_cnt_history}) | 14日加书架数: ${formatCount(bookData.add_shelf_count_14d)} (${bookData.add_shelf_count_14d}) | 占比: ${(bookData.add_shelf_count_14d / bookData.shelf_cnt_history * 100).toFixed(3)}%</p>
+<p>活跃读者数: ${formatCount(bookData.read_count)} (${bookData.read_count}) | 总读者数: ${formatCount(
+            bookData.read_count_all
+          )} (${bookData.read_count_all}) | 占比: ${((bookData.read_count / bookData.read_count_all) * 100).toFixed(
+            3
+          )}%</p>
+<p>总加书架数: ${formatCount(bookData.shelf_cnt_history)} (${bookData.shelf_cnt_history}) | 14日加书架数: ${formatCount(
+            bookData.add_shelf_count_14d
+          )} (${bookData.add_shelf_count_14d}) | 占比: ${(
+            (bookData.add_shelf_count_14d / bookData.shelf_cnt_history) *
+            100
+          ).toFixed(3)}%</p>
 <hr>
 <h3 align="center">各子平台上线时间</h3>
 <p>没做</p>
@@ -955,16 +1302,19 @@
       async function downloadEpub(result, catalog, bookData, progress, cssMap) {
         const saver = new EpubSaver()
         let intr = ''
-        await saver.setInfo('bookname', bookData.book_name)
+        await saver.setInfo('title', bookData.book_name)
         intr += `分类：${JSON.parse(bookData.category_v2)
           .map(item => item.Name)
           .join('、')}\n`
         intr += `主角：${JSON.parse(bookData.roles || '[]').join('、')}\n`
         intr += `简介：${bookData.abstract}\n`
         intr += `${bookData.copyright_info.replace('，如有任何疑问，请通过“我的-意见反馈”告知我们', '')}。`
-        await saver.setInfo('introduction', intr)
+        await saver.setInfo('description', intr)
+        await saver.setInfo('generator', 'PyFQWeb - WebDownloader / EpubSaver.js')
+        await saver.setInfo('language', 'zh-CN')
+        await saver.setInfo('creator', bookData.author)
         await saver.setInfo('author', bookData.author)
-        await saver.setInfo('cover', replaceCover(bookData.thumb_url))
+        await saver.cover(replaceCover(bookData.thumb_url))
         // 这个从番茄 APP 里偷出来的
         await saver.addCSS(
           0,
@@ -1129,7 +1479,7 @@ sup{
         )
         let cssMapIdx
         if (cssMap && typeof cssMap === 'object') {
-          cssMapIdx = await saver.createCSSMap(cssMap)
+          cssMapIdx = await saver.addCSSMap(cssMap)
         }
         let volname = '默认卷'
         let curvolidx = 0
@@ -1140,37 +1490,32 @@ sup{
           const data = result[i.item_id]
           if (data?.novel_data?.volume_name && volname != data.novel_data.volume_name) {
             volname = data.novel_data.volume_name
-            currentVolume = await saver.addVolume(volname, curvolidx++)
+            currentVolume = await saver.addVolume(curvolidx++, volname)
             console.log('更换卷', currentVolume)
           }
           if (typeof currentVolume === 'undefined') {
-            currentVolume = await saver.addVolume(volname, curvolidx)
+            currentVolume = await saver.addVolume(curvolidx, volname)
+            console.log('创建新卷', currentVolume)
           }
           const curChapContent = data.content || '<p>正文内容为空</p>'
-          const curChapCSSMap = JSON.parse(data?.novel_data?.css_map || '{}')
-          const curChapterCSSIdx = []
-          if (data?.novel_data?.css_map && cssMapIdx) {
-            for (const top of Object.keys(curChapCSSMap)) {
-              console.log('fileinfo', top)
-              curChapterCSSIdx.push(cssMapIdx[top])
-            }
-          }
           await currentVolume.addChapter(
             cursor++,
-            curChapContent,
             i.title,
+            curChapContent,
             curChapContent.includes('xhtml') ? 'xhtml' : 'html',
-            curChapContent.includes('<article>'),
-            true,
-            curChapterCSSIdx
+            true
           )
           progress.updateProgressBar(cursor)
         }
-        if (progress.isCancelled) return
+        if (progress.isCancelled) {
+          delete saver
+          return
+        }
         progress.updateTitle('正在生成EPUB...')
         progress.total = 1
         progress.updateProgressBar(0)
         const epub = await saver.save()
+        console.log(epub)
         progress.updateProgressBar(1)
         progress.updateTitle('执行完成，正在保存')
         progress.complete(false)
@@ -1232,7 +1577,7 @@ sup{
         const result = {}
         let cursor = 0
 
-        const maxConcurrentRequests = 32
+        const maxConcurrentRequests = 64
 
         const downloadChunks = async () => {
           const concurrencyLimit = maxConcurrentRequests
@@ -1348,7 +1693,9 @@ sup{
           }
           let text =
             `${i.title}\n\u3000\u3000` +
-            htmlToTextArray((data?.content || '<p>章节内容为空</p>').replace(new RegExp(escapeRegExp(i.title), 'g'), ''))
+            htmlToTextArray(
+              (data?.content || '<p>章节内容为空</p>').replace(new RegExp(escapeRegExp(i.title), 'g'), '')
+            )
               .join('\n\u3000\u3000')
               .trim() +
             '\n\n\n' // .replace(`${i.title}\n\u3000\u3000${i.title}`, i.title) + '\n\n\n';
@@ -1381,14 +1728,17 @@ sup{
           let urls = [item.main_url, item.backup_url]
           urls = urls.filter(_ => !_.includes('://v3-'))
           return urls[0] || getCORSAvailableAudioURL(item_id, tone_id, try_num++)
-        } catch(e) {
+        } catch (e) {
           console.error(e)
           return getCORSAvailableAudioURL(item_id, tone_id, try_num++)
         }
       }
 
       async function downloadAudioExecutor() {
-        const tone_id = prompt('部分浏览器会弹出警告，网页尝试下载多个文件，请允许请求！\n请输入音色ID（对于番茄畅听类真人朗读，这个值会被忽略）: ', '1')
+        const tone_id = prompt(
+          '部分浏览器会弹出警告，网页尝试下载多个文件，请允许请求！\n请输入音色ID（对于番茄畅听类真人朗读，这个值会被忽略）: ',
+          '1'
+        )
         window.downloadResult = ''
         const Lock = document.getElementById('download_lock')
 
@@ -1423,96 +1773,96 @@ sup{
           Lock.innerHTML = ''
           return
         }
-      
-        const progress = showProgressWindow('下载', catalog.length, true);
-        progress.updateTitle('准备中...');
-        progress.subProgress.updateTitle('准备中');
-        
+
+        const progress = showProgressWindow('下载', catalog.length, true)
+        progress.updateTitle('准备中...')
+        progress.subProgress.updateTitle('准备中')
+
         // 添加取消监听
-        let activeXHR = null;
+        let activeXHR = null
         progress.onCancel = () => {
+          console.log(activeXHR)
           if (activeXHR) {
-            activeXHR.abort();
-            activeXHR = null;
+            activeXHR.abort()
+            activeXHR = null
           }
-          Lock.innerHTML = '';
-        };
-      
+          Lock.innerHTML = ''
+        }
+
         try {
           for (let index = 0; index < catalog.length; index++) {
             // 检查取消状态
             if (progress.isCancelled) {
               console.warn('aborting...')
-              break;
+              break
             }
-      
-            const item = catalog[index];
-            
+
+            const item = catalog[index]
+
             // 更新主进度
-            progress.updateProgressBar(index);
-            progress.updateTitle(`缓存中: ${item.title}`);
-            
+            progress.updateProgressBar(index)
+            progress.updateTitle(`缓存中: ${item.title}`)
+
             // 重置副进度
-            progress.subProgress.updateProgressBar(0);
-            progress.subProgress.updateTitle('等待开始...');
-      
+            progress.subProgress.updateProgressBar(0)
+            progress.subProgress.updateTitle('等待开始...')
+
             // 获取下载链接
-            const aurl = await getCORSAvailableAudioURL(item.item_id, tone_id).catch(() => null);
+            const aurl = await getCORSAvailableAudioURL(item.item_id, tone_id).catch(() => null)
             if (!aurl) {
-              console.error('目录', item.item_id, item.title, '解析失败');
-              continue;
+              console.error('目录', item.item_id, item.title, '解析失败')
+              continue
             }
 
             // 创建下载任务
-            const { promise, xhr } = createDownloadTask(aurl, item, progress);
-            activeXHR = xhr; // 保存当前XHR引用
+            const { promise, xhr } = createDownloadTask(aurl, item, progress)
+            activeXHR = xhr // 保存当前XHR引用
 
             try {
-              await promise;
-              progress.updateProgressBar(index + 1);
+              await promise
+              progress.updateProgressBar(index + 1)
             } catch (e) {
               if (e.name !== 'AbortError') {
-                console.error(`下载失败: ${item.title}`, e);
+                console.error(`下载失败: ${item.title}`, e)
               }
-              if (progress.isCancelled) break;
+              if (progress.isCancelled) break
             }
           }
         } finally {
-          activeXHR = null;
+          activeXHR = null
           if (!progress.isCancelled) {
-            progress.updateTitle('完成');
+            progress.updateTitle('完成')
+            progress.complete(false)
           }
-          progress.complete(false);
-          Lock.innerHTML = '';
+          Lock.innerHTML = ''
         }
       }
 
       // 创建下载任务
       function createDownloadTask(url, item, progress) {
-        let xhr = null;
-        
-        const promise = new Promise((resolve, reject) => {
-          // 独立进度回调
-          const callback = {
-            ptext: '',
-            stext: '',
-            onProgress(recv, total) {
-              this.ptext = `${formatSize(recv)}/${formatSize(total)}`;
-              progress.subProgress.updateProgressBar(Math.ceil(recv / total * 100));
-              progress.subProgress.updateTitle(`${this.ptext} | ${this.stext}`);
-            },
-            onNetSpeed(bps) {
-              this.stext = formatSpeed(bps);
-              progress.subProgress.updateTitle(`${this.ptext} | ${this.stext}`);
-            },
-            onComplete: resolve,
-            onError: reject
-          };
-      
-          xhr = downloadFile(url, `${item.title}.mp3`, callback);
-        });
-      
-        return { promise, xhr };
+        const callback = {
+          ptext: '',
+          stext: '',
+          onProgress(recv, total) {
+            this.ptext = `${formatSize(recv)}/${formatSize(total)}`
+            progress.subProgress.updateProgressBar(Math.ceil((recv / total) * 100))
+            progress.subProgress.updateTitle(`${this.ptext} | ${this.stext}`)
+          },
+          onNetSpeed(bps) {
+            this.stext = formatSpeed(bps)
+            progress.subProgress.updateTitle(`${this.ptext} | ${this.stext}`)
+          },
+          onComplete: () => {},
+          onError: () => {},
+        }
+
+        const { xhr, promise } = downloadFile(url, `${item.title}.mp3`, callback)
+
+        const wrappedPromise = promise.catch(e => {
+          if (e.name !== 'AbortError') throw e
+        })
+
+        return { promise: wrappedPromise, xhr }
       }
 
       async function downloadBook() {
@@ -1557,7 +1907,9 @@ sup{
       function reDownload() {
         const charset = document.getElementById('charset-selector').value.toLowerCase()
         let encoded =
-          charset === 'gbk' ? encodeGBK(window.downloadResult.content) : new TextEncoder(charset).encode(window.downloadResult.content)
+          charset === 'gbk'
+            ? encodeGBK(window.downloadResult.content)
+            : new TextEncoder(charset).encode(window.downloadResult.content)
         const blob = new Blob([encoded], { type: `text/plain;charset=${charset}` })
         saveAs(blob, window.downloadResult.file)
       }
@@ -1647,7 +1999,7 @@ sup{
           },
           updateProgressBar(fillPercent) {
             subProgressBarFill.style.width = `${fillPercent}%`
-          }
+          },
         }
         const obj = {
           total,
@@ -1671,7 +2023,12 @@ sup{
             this.isCancelled = true
             progressModal.style.display = 'none'
             document.getElementById('download_lock').innerHTML = ''
+            progressCancelBtn.style = ''
+            progressSubmitBtn.style.display = 'none'
+            redlButton.style.display = 'none'
+            resaveButton.style.display = 'none'
             subProgressModal.style.display = 'none'
+            if (this.onCancel) this.onCancel()
           },
           complete(allowResave = true) {
             progressSubmitBtn.style = ''
@@ -1719,101 +2076,99 @@ sup{
       }
 
       function downloadFile(url, filename, callback) {
-        return new Promise((resolve, reject) => {
-          // 参数标准化处理
-          if (typeof filename === 'object' || typeof filename === 'function') {
-            callback = filename;
-            filename = null;
+        // 参数标准化处理
+        if (typeof filename === 'object' || typeof filename === 'function') {
+          callback = filename
+          filename = null
+        }
+        callback = callback || {}
+
+        const xhr = new XMLHttpRequest()
+        xhr.open('GET', url, true)
+        xhr.responseType = 'blob'
+        xhr.withCredentials = false
+
+        let currentLoaded = 0
+        let lastLoaded = 0
+        let lastTime = Date.now()
+        let netSpeedTimer = null
+
+        xhr.onprogress = event => {
+          currentLoaded = event.loaded
+          callback.onProgress?.(event.loaded, event.lengthComputable ? event.total : 0)
+        }
+
+        netSpeedTimer = setInterval(() => {
+          const now = Date.now()
+          const timeDiff = (now - lastTime) / 1000
+          if (timeDiff > 0) {
+            const speed = (currentLoaded - lastLoaded) / timeDiff
+            callback.onNetSpeed?.(speed)
+            lastLoaded = currentLoaded
+            lastTime = now
           }
-          callback = callback || {};
-      
-          const xhr = new XMLHttpRequest();
-          xhr.open('GET', url, true);
-          xhr.responseType = 'blob';
-          xhr.withCredentials = false;
-      
-          let currentLoaded = 0;
-          let lastLoaded = 0;
-          let lastTime = Date.now();
-          let netSpeedTimer = null;
-      
-          xhr.onprogress = (event) => {
-            currentLoaded = event.loaded;
-            callback.onProgress?.(event.loaded, event.lengthComputable ? event.total : 0);
-          };
-      
-          netSpeedTimer = setInterval(() => {
-            const now = Date.now();
-            const timeDiff = (now - lastTime) / 1000;
-            if (timeDiff > 0) {
-              const speed = (currentLoaded - lastLoaded) / timeDiff;
-              callback.onNetSpeed?.(speed);
-              lastLoaded = currentLoaded;
-              lastTime = now;
-            }
-          }, 500);
-      
-          // 修改完成处理
+        }, 500)
+
+        const promise = new Promise((resolve, reject) => {
           xhr.onload = () => {
-            clearInterval(netSpeedTimer);
+            clearInterval(netSpeedTimer)
             if (xhr.status >= 200 && xhr.status < 300) {
               try {
-                const blob = xhr.response;
-                const urlObject = URL.createObjectURL(blob);
-                const a = document.createElement('a');
-                a.href = urlObject;
-                a.download = filename || getFilenameFromHeaders(xhr) || getFilenameFromUrl(url);
-                document.body.appendChild(a);
-                a.click();
+                const blob = xhr.response
+                const urlObject = URL.createObjectURL(blob)
+                const a = document.createElement('a')
+                a.href = urlObject
+                a.download = filename || getFilenameFromHeaders(xhr) || getFilenameFromUrl(url)
+                document.body.appendChild(a)
+                a.click()
                 setTimeout(() => {
-                  document.body.removeChild(a);
-                  URL.revokeObjectURL(urlObject);
-                  callback.onComplete?.();
-                  resolve();
-                }, 300); // 延长确保点击完成
+                  document.body.removeChild(a)
+                  URL.revokeObjectURL(urlObject)
+                  callback.onComplete?.()
+                  resolve()
+                }, 300)
               } catch (e) {
-                callback.onError?.(e);
-                reject(e);
+                callback.onError?.(e)
+                reject(e)
               }
             } else {
-              handleError(new Error(`HTTP Error ${xhr.status}`));
+              handleError(new Error(`HTTP Error ${xhr.status}`))
             }
-          };
-      
-          // 统一错误处理
-          const handleError = (e) => {
-            clearInterval(netSpeedTimer);
-            callback.onError?.(e);
-            reject(e);
-          };
-      
-          // 添加中止监听
-          xhr.onabort = () => handleError(new DOMException('Aborted', 'AbortError'));
-          xhr.onerror = (e) => handleError(e);
-      
-          xhr.send();
-          return xhr; // 返回XHR对象用于取消
-        });
+          }
+
+          const handleError = e => {
+            clearInterval(netSpeedTimer)
+            callback.onError?.(e)
+            reject(e)
+          }
+
+          xhr.onabort = () => handleError(new DOMException('Aborted', 'AbortError'))
+          xhr.onerror = handleError
+        })
+
+        xhr.send()
+
+        return { xhr, promise } // 返回xhr和promise
       }
 
       // 从响应头获取文件名
       function getFilenameFromHeaders(xhr) {
         try {
-          const disposition = xhr.getResponseHeader('Content-Disposition') || '';
-          const filename = disposition.split('filename=')[1]?.split(/[;,\r\n]/)[0];
-          return filename ? filename.replace(/^['"]|['"]$/g, '') : null;
+          const disposition = xhr.getResponseHeader('Content-Disposition') || ''
+          const filename = disposition.split('filename=')[1]?.split(/[;,\r\n]/)[0]
+          return filename ? filename.replace(/^['"]|['"]$/g, '') : null
         } catch {
-          return null;
+          return null
         }
       }
-      
+
       function formatSize(bytes) {
         if (bytes === 0) return '0 B'
         const units = ['B', 'KB', 'MB', 'GB']
         const i = Math.floor(Math.log(bytes) / Math.log(1024))
         return `${(bytes / Math.pow(1024, i)).toFixed(1)} ${units[i]}`
       }
-      
+
       function formatSpeed(bytesPerSecond) {
         if (bytesPerSecond > 1024 * 1024) {
           return `${(bytesPerSecond / 1024 / 1024).toFixed(2)} MB/s`
@@ -1824,9 +2179,9 @@ sup{
       // 从URL路径获取文件名
       function getFilenameFromUrl(url) {
         try {
-          return new URL(url).pathname.split('/').pop() || 'download';
+          return new URL(url).pathname.split('/').pop() || 'download'
         } catch {
-          return 'download';
+          return 'download'
         }
       }
 
@@ -1834,7 +2189,11 @@ sup{
       bookNameDialog.addEventListener('click', event => {
         const content = bookNameDialog.querySelector('.internal-alert-container')
         const rect = content.getBoundingClientRect()
-        const isOutside = event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom
+        const isOutside =
+          event.clientX < rect.left ||
+          event.clientX > rect.right ||
+          event.clientY < rect.top ||
+          event.clientY > rect.bottom
         if (isOutside) bookNameDialog.close()
       })
       document.getElementById('book-title').onclick = () => {
@@ -1865,11 +2224,11 @@ sup{
       }
 
       :root {
-        --bg-color: #fff;
+        --bg-color: #fffafe;
         --text-color: #000;
-        --button-bg: #007bff;
+        --button-bg: #69b3f0;
         --button-text: #fff;
-        --button-hover-bg: #0056b3;
+        --button-hover-bg: #58a2e9;
         --info-bg: #f9f9f9;
         --download-bg: #28a745;
         --download-text: #fff;
@@ -2165,7 +2524,7 @@ sup{
       .progress-submit:hover {
         background: var(--download-hover-bg);
       }
-      
+
       .footer {
         width: 100%;
         display: flex;
