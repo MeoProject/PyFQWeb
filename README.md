@@ -54,6 +54,11 @@ pm2 start npm --name "pyfqweb" -- start
 - 请求体格式：保持与官方API一致
 ```
 
+### 衍生项目
+ - `web.html`: 网页端番茄下载器
+ - `llepub-latest.js`: 浏览器端 EPUB 下载库
+ - `user-script.user.js`: 番茄小说网页辅助用户脚本
+
 ## 协议条款
 
 ### 授权声明
